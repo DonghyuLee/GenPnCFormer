@@ -2,6 +2,7 @@ __pycache__/
 *.pt
 *.pth
 *.npy
+*.png
 *.log
 data/
 outputs/
