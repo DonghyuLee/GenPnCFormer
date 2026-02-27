@@ -327,7 +327,9 @@ def run_inference_and_evaluation(cfg, device,
                                  w_cfg: float = 5.0,
                                  ddim_steps: int = 50,
                                  eta: float = 0.0,
-                                 test_paths: list | None = None):
+                                 test_paths: list | None = None,
+                                 diffusion_path: str | None = None,
+                                 vae_path: str | None = None):
     """
     1) DDPM 샘플링 → VAE 디코딩
     2) Surrogate(PnCFormer)로 band mask 예측

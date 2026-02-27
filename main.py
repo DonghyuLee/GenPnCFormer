@@ -6,7 +6,8 @@ from data_utils import load_or_build_cache_multimat
 from vae import train_vae, build_vae_latent_cache, ConditionalVAE
 from diffusion import train_latent_diffusion
 from eval import run_inference_and_evaluation, visualize_dispersion_comparison, compare_condition_vs_surrogate_truth
-
+from benchmark import measure_efficiency
+import matplotlib.pyplot as plt
 
 if __name__ == "__main__":
     cfg = CFG()
@@ -17,7 +18,6 @@ if __name__ == "__main__":
     
     # 2) VAE 학습 및 로딩 (Architecture Mismatch 처리)
     vae_ckpt_path = os.path.join(cfg.save_dir, "vae_model_best.pt")
-    
     vae = ConditionalVAE(cfg).to(device)
     
     # Checkpoint 로딩 시도 (Architecture Mismatch 체크)
@@ -59,7 +59,6 @@ if __name__ == "__main__":
     print("[VAE] Latent cache ready.")
     
     # 💡 [Data Reporting] Print dataset sizes
-    # 💡 [Data Reporting] Print dataset sizes (Sum of individual files)
     print("\n--- Dataset Summary ---")
     for split_name, path_list in [("train", train_paths), ("valid", valid_paths), ("test", test_paths)]:
         total_samples = 0
@@ -102,7 +101,8 @@ if __name__ == "__main__":
         os.makedirs(cfg.save_dir, exist_ok=True)
         
         # DDPM 학습
-        ddpm_ckpt_path = os.path.join(cfg.save_dir, "ddpm_best.pt")
+        out_name = f"ddpm_{getattr(cfg, 'diffusion_backbone', 'transformer')}_best.pt"
+        ddpm_ckpt_path = os.path.join(cfg.save_dir, out_name)
 
         if not skip_vae_train and os.path.exists(ddpm_ckpt_path):
             print(f"[DDPM {mode.upper()}] VAE was retrained. Removing old DDPM checkpoint: {ddpm_ckpt_path}")
@@ -127,7 +127,10 @@ if __name__ == "__main__":
             print(f"[DDPM {mode.upper()}] Training finished. checkpoint: {ddpm_ckpt_path}")
 
         # 5) 평가
-        run_inference_and_evaluation(cfg, device, min_width=0.0, w_cfg=5.0, ddim_steps=50, eta=0.0, test_paths=test_paths)
+        run_inference_and_evaluation(
+            cfg, device, min_width=0.0, w_cfg=5.0, ddim_steps=50, eta=0.0,
+            test_paths=test_paths, diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path
+        )
 
         # 6) 결과 시각화 (hybrid만 시각화)
         if mode == "hybrid":
@@ -135,8 +138,6 @@ if __name__ == "__main__":
             visualize_dispersion_comparison(cfg, device, save_dir=vis_dir, w_cfg=5.0)
 
     # 7) 전체 모드 Benchmarking (효율성 통합 비교)
-    from benchmark import measure_efficiency
-    import matplotlib.pyplot as plt
 
     print("\n--- Starting Benchmark (Efficiency) ---")
     results = []
