@@ -77,7 +77,8 @@ if __name__ == "__main__":
     print("-----------------------\n")
 
     # 4) DDPM 학습 및 평가 파이프라인 (Multi-Mode 지원)
-    modes = ["film", "mhca", "hybrid"]
+    # modes = ["film", "mhca", "hybrid"]
+    modes = ["mhca", "hybrid"]
     base_save_dir = cfg.save_dir
 
     for mode in modes:

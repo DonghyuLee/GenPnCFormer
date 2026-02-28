@@ -898,13 +898,11 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
     weight_decay = getattr(cfg, "weight_decay", 1e-2)
     opt = torch.optim.AdamW(trainable_params, lr=cfg.lr_diffusion, weight_decay=weight_decay)
     
-    # 💡 [New] Scheduler Setup
-    # 💡 [New] Scheduler Setup
+    # 💡 [New] Scheduler Setup (Native PyTorch to prevent AMP state_steps bug)
     num_training_steps = cfg.epochs_diffusion * len(train_dl)
-    num_warmup_steps = getattr(cfg, "warmup_epochs", 5) * len(train_dl)
-    scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps, num_training_steps)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_training_steps, eta_min=1e-6)
     
-    print(f"[DDPM] Scheduler: Cosine Warmup (Warmup: {num_warmup_steps} steps, Total: {num_training_steps} steps)")
+    print(f"[DDPM] Scheduler: CosineAnnealingLR (Total: {num_training_steps} steps)")
     
     # 💡 [Optimization] AMP GradScaler
     scaler = torch.amp.GradScaler('cuda')
