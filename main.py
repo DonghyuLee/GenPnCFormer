@@ -78,7 +78,8 @@ if __name__ == "__main__":
 
     # 4) DDPM 학습 및 평가 파이프라인 (Multi-Mode 지원)
     # modes = ["film", "mhca", "hybrid"]
-    modes = ["mhca", "hybrid"]
+    # modes = [ "hybrid", "mhca"]
+    modes = ['film']
     base_save_dir = cfg.save_dir
 
     for mode in modes:
@@ -128,15 +129,18 @@ if __name__ == "__main__":
             print(f"[DDPM {mode.upper()}] Training finished. checkpoint: {ddpm_ckpt_path}")
 
         # 5) 평가
-        run_inference_and_evaluation(
-            cfg, device, min_width=0.0, w_cfg=5.0, ddim_steps=50, eta=0.0,
-            test_paths=test_paths, diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path
-        )
+        # run_inference_and_evaluation(
+        #     cfg, device, min_width=0.0, w_cfg=5.0, ddim_steps=50, eta=0.0,
+        #     test_paths=test_paths, diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path
+        # )
 
-        # 6) 결과 시각화 (hybrid만 시각화)
-        if mode == "hybrid":
-            vis_dir = f"vis_results_{mode}"
-            visualize_dispersion_comparison(cfg, device, save_dir=vis_dir, w_cfg=5.0)
+        # 6) 결과 시각화 
+        # if mode == "hybrid":
+        vis_dir = f"vis_results_{mode}"
+        visualize_dispersion_comparison(
+            cfg, device, save_dir=vis_dir, w_cfg=5.0,
+            diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path
+        )
 
     # 7) 전체 모드 Benchmarking (효율성 통합 비교)
 

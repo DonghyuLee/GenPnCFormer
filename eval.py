@@ -580,7 +580,9 @@ def visualize_dispersion_comparison(cfg, device,
                                        save_dir: str = "vis_results",
                                        w_cfg: float = 5.0,
                                        ddim_steps: int = 50,
-                                       test_paths: list | None = None):
+                                       test_paths: list | None = None,
+                                       diffusion_path: str | None = None,
+                                       vae_path: str | None = None):
     """
     User Request:
       - Bulk export: 6 Materials (CA..AT) * 28 Structures * 20 Samples = 3360 images.
@@ -595,8 +597,10 @@ def visualize_dispersion_comparison(cfg, device,
     os.makedirs(save_dir, exist_ok=True)
 
     # --- Load DDPM & VAE ---
-    ddpm_state = torch.load(os.path.join(cfg.save_dir, "ddpm_best.pt"),
-                            map_location=device, weights_only=True)
+    ddpm_ckpt_path = diffusion_path if diffusion_path else os.path.join(cfg.save_dir, "ddpm_transformer_best.pt")
+    vae_ckpt_path  = vae_path if vae_path else os.path.join(cfg.save_dir, "vae_model_best.pt")
+
+    ddpm_state = torch.load(ddpm_ckpt_path, map_location=device, weights_only=True)
     
     # model selection
     backbone_type = getattr(cfg, "diffusion_backbone", "transformer")
@@ -621,8 +625,7 @@ def visualize_dispersion_comparison(cfg, device,
     ddpm.eval()
 
     vae_decoder = VAE_Decoder(cfg).to(device)
-    full_vae = torch.load(os.path.join(cfg.save_dir, "vae_model_best.pt"),
-                          map_location=device, weights_only=True)
+    full_vae = torch.load(vae_ckpt_path, map_location=device, weights_only=True)
     dec_keys = {k.replace("decoder.", "", 1): v for k, v in full_vae.items() if k.startswith("decoder.")}
     vae_decoder.load_state_dict(dec_keys); vae_decoder.eval()
 

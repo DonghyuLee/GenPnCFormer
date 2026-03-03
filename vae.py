@@ -375,7 +375,8 @@ def train_vae(cfg, device, train_paths=None, valid_paths=None):
 
     # 2. 모델 및 옵티마이저 (이전과 동일)
     model = ConditionalVAE(cfg).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    # 💡 [Fix] foreach=False bypasses the buggy PyTorch 2.x C++ _multi_tensor_adamw loop
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY, foreach=False)
     
     best_val_loss = float('inf')
     os.makedirs(cfg.save_dir, exist_ok=True)

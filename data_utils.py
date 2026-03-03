@@ -5,6 +5,10 @@ from scipy.signal import find_peaks
 import torch
 import torch.nn.functional as F
 
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+import matplotlib.pyplot as plt
+
 # ==============================================================================
 
 def calculate_features(X):
@@ -190,9 +194,7 @@ def split_datasets(X_list, D_list, F_list, M_list, cfg):
 
     return X_train, D_train, F_train, M_train, X_valid, D_valid, F_valid, M_valid, X_test, D_test, F_test, M_test
 
-from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
-import matplotlib.pyplot as plt
+
 
 def visualize_sample_paper(
     frequencies,

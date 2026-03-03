@@ -896,7 +896,8 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
 
     trainable_params = list(ddpm.parameters())
     weight_decay = getattr(cfg, "weight_decay", 1e-2)
-    opt = torch.optim.AdamW(trainable_params, lr=cfg.lr_diffusion, weight_decay=weight_decay)
+    # 💡 [Fix] foreach=False bypasses the buggy PyTorch 2.x C++ _multi_tensor_adamw loop
+    opt = torch.optim.AdamW(trainable_params, lr=cfg.lr_diffusion, weight_decay=weight_decay, foreach=False)
     
     # 💡 [New] Scheduler Setup (Native PyTorch to prevent AMP state_steps bug)
     num_training_steps = cfg.epochs_diffusion * len(train_dl)
@@ -974,4 +975,5 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
             torch.save(ddpm.state_dict(), os.path.join(cfg.save_dir, out_name))
             print(f"Saved best model (loss={best_val_loss:.6f})")
     
-    return os.path.join(cfg.save_dir, "ddpm_best.pt")
+    out_name = f"ddpm_{getattr(cfg, 'diffusion_backbone', 'transformer')}_best.pt"
+    return os.path.join(cfg.save_dir, out_name)
