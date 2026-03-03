@@ -435,6 +435,45 @@ def build_cache_multimat(cfg):
                     M = np.zeros((udr_relation.shape[0], k_lim), dtype=np.int8)
                     for i in range(udr_relation.shape[0]):
                         build_band_mask(udr_relation[i], sdr_relation[i], out_mask=M[i])
+                        
+                        # Apply 'Don't Care' (Class 3) Masking for Inverse Design
+                        # 0: Pass, 1: Gap, 2: Defect -> Keep only one contiguous Gap+Defect region
+                        curr_mask = M[i]
+                        gap_defect_mask = (curr_mask == 1) | (curr_mask == 2)
+                        
+                        # Find contiguous regions of gaps/defects
+                        runs = _runs_bool(gap_defect_mask)
+                        
+                        # Filter runs: only keep those >= 5kHz (50 bins at 0.1kHz resolution)
+                        valid_runs = []
+                        for (start_idx, end_idx) in runs:
+                            if (end_idx - start_idx + 1) >= 50:
+                                valid_runs.append((start_idx, end_idx))
+                        
+                        # If there is at least one valid wide bandgap
+                        if len(valid_runs) > 0:
+                            # Randomly pick one gap to preserve
+                            target_run_idx = np.random.randint(len(valid_runs))
+                            keep_start, keep_end = valid_runs[target_run_idx]
+                            
+                            # Create a new mask filled with 3 (Don't Care)
+                            new_mask = np.full_like(curr_mask, 3, dtype=np.int8)
+                            
+                            # Add 0-padding (Pass-band boundary constraint) 20 bins (2kHz) around the gap
+                            pad_start = max(0, keep_start - 20)
+                            pad_end = min(k_lim, keep_end + 1 + 20)
+                            
+                            # First, apply 0 to the padded region
+                            new_mask[pad_start:keep_start] = 0
+                            new_mask[keep_end+1:pad_end] = 0
+                            
+                            # Finally, restore the targeted gap and its defects
+                            # This overrides any padding overlap if defects are on the extreme edge
+                            new_mask[keep_start:keep_end+1] = curr_mask[keep_start:keep_end+1]
+                            M[i] = new_mask
+                        else:
+                            # If no gaps >= 5kHz exist, everything is Don't Care
+                            M[i] = np.full_like(curr_mask, 3, dtype=np.int8)
 
                     X_local.append(X6)
                     D_local.append(sdr_relation)

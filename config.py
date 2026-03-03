@@ -15,8 +15,8 @@ print("Device:", device)
 class CFG:
     # Common Config
     data_dir: str = "data"
-    cache_dir: str = "data/cache_v2.1.1"
-    save_dir: str = "./checkpoints/v2.1.1"
+    cache_dir: str = "data/cache_v2.2.0"
+    save_dir: str = "./checkpoints/v2.2.0"
     target_folders: list = ("CA", "SA", "TA", "AC", "AS", "AT") # 💡 Multi-Material Support
 
     # Data Config
