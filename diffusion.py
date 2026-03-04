@@ -723,6 +723,46 @@ class DDPM(nn.Module):
         return z           
 
 
+class EMA:
+    """
+    Exponential Moving Average of model parameters.
+    """
+    def __init__(self, model, decay=0.9999):
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+
+    def apply_shadow(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+
+    def restore(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+        
+    def state_dict(self):
+        return self.shadow
+        
+    def load_state_dict(self, state_dict):
+        self.shadow = state_dict
+
+
 class LatentCondDataset(Dataset):
     def __init__(self, npz_path: str, scale_factor: float = 1.0):
         print(f"Loading VAE Latent Cache from {npz_path} (Scale Factor: {scale_factor})...")
@@ -891,20 +931,36 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
     ddpm = DDPM(model, cfg.timesteps, cfg.beta_start, cfg.beta_end).to(device)
 
     # 💡 [Resume Logic]
+    start_epoch = 0
+    best_val_loss = float('inf')
+    
+    # Initialize EMA
+    ema = EMA(ddpm, decay=0.9999)
+    print(f"[DDPM] EMA Enabled (Decay: 0.9999)")
+    
     if resume_path and os.path.exists(resume_path):
         print(f"[DDPM] Resuming from checkpoint: {resume_path}")
         try:
             state = torch.load(resume_path, map_location=device, weights_only=True)
-            ddpm.load_state_dict(state, strict=False)
-            print("[DDPM] Successfully loaded weights.")
+            if "ddpm" in state:
+                ddpm.load_state_dict(state["ddpm"], strict=False)
+                start_epoch = state.get("epoch", -1) + 1  # start from next epoch
+                best_val_loss = state.get("best_val_loss", float('inf'))
+                if "ema" in state:
+                    ema.load_state_dict(state["ema"])
+                    print("[DDPM] Successfully loaded EMA weights.")
+                print(f"[DDPM] Successfully loaded weights. Resuming from epoch {start_epoch+1} with best_val_loss={best_val_loss:.6f}")
+            else:
+                ddpm.load_state_dict(state, strict=False)
+                print("[DDPM] Successfully loaded legacy weights (no epoch info).")
         except Exception as e:
             print(f"[DDPM] Failed to load checkpoint: {e}")
             print("[DDPM] Starting from scratch.")
 
     trainable_params = list(ddpm.parameters())
-    weight_decay = getattr(cfg, "weight_decay", 1e-2)
-    # 💡 [Fix] foreach=False bypasses the buggy PyTorch 2.x C++ _multi_tensor_adamw loop
-    opt = torch.optim.AdamW(trainable_params, lr=cfg.lr_diffusion, weight_decay=weight_decay, foreach=False)
+    weight_decay = getattr(cfg, "weight_decay", 0.0)
+    # 💡 [Fix] Use fused=True for PyTorch 2.x AMP compatibility (avoids the state_steps tensor bug)
+    opt = torch.optim.AdamW(trainable_params, lr=cfg.lr_diffusion, weight_decay=weight_decay, fused=True)
     
     # 💡 [New] Scheduler Setup (Native PyTorch to prevent AMP state_steps bug)
     num_training_steps = cfg.epochs_diffusion * len(train_dl)
@@ -917,9 +973,13 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
     print("[DDPM] AMP Enabled.")
     
     # 3. 훈련 루프
-    best_val_loss = float('inf')
     
-    for epoch in range(cfg.epochs_diffusion):
+    if start_epoch >= cfg.epochs_diffusion:
+        print(f"[DDPM] Already reached target epochs ({start_epoch} >= {cfg.epochs_diffusion}). Skipping training.")
+        out_name = f"ddpm_{getattr(cfg, 'diffusion_backbone', 'transformer')}_best.pt"
+        return os.path.join(cfg.save_dir, out_name)
+    
+    for epoch in range(start_epoch, cfg.epochs_diffusion):
         ddpm.train()        
         pbar = tqdm(train_dl, desc=f"[DDPM] {epoch+1}/{cfg.epochs_diffusion}", total=len(train_dl), dynamic_ncols=True, mininterval=0.1)
         last_batch_loss = 0.0
@@ -968,18 +1028,37 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
             scaler.update()
             scheduler.step()
             
+            # Update EMA weights
+            ema.update(ddpm)
+            
             last_batch_loss = loss.item()
-            pbar.set_postfix(mae=f"{last_batch_loss:.4f}")
+            pbar.set_postfix({"mae": f"{last_batch_loss:.4f}"})
             batch_idx += 1
             
         # Validation (Run every epoch for better tracking)
+        # Apply EMA weights before validation
+        ema.apply_shadow(ddpm)
         val_loss = validate_diffusion(ddpm, val_dl, cfg, device)
-        print(f"Epoch {epoch+1} Val Loss: {val_loss:.6f}")
+        # Restore active weights after validation
+        ema.restore(ddpm)
+        
+        print(f"Epoch {epoch+1} Val Loss (EMA): {val_loss:.6f}")
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             # Save format: ddpm_transformer_best.pt to distinguish backbone (defaults to transformer)
             out_name = f"ddpm_{getattr(cfg, 'diffusion_backbone', 'transformer')}_best.pt"
-            torch.save(ddpm.state_dict(), os.path.join(cfg.save_dir, out_name))
+            
+            # Temporarily apply EMA to save the EMA weights as the main ddpm state
+            ema.apply_shadow(ddpm)
+            state_dict = {
+                "ddpm": ddpm.state_dict(),
+                "ema": ema.state_dict(),
+                "epoch": epoch,
+                "best_val_loss": best_val_loss
+            }
+            torch.save(state_dict, os.path.join(cfg.save_dir, out_name))
+            ema.restore(ddpm)
+            
             print(f"Saved best model (loss={best_val_loss:.6f})")
     
     out_name = f"ddpm_{getattr(cfg, 'diffusion_backbone', 'transformer')}_best.pt"

@@ -101,6 +101,7 @@ if __name__ == "__main__":
             print(f"[DDPM {mode.upper()}] VAE was retrained. Renaming old DDPM checkpoint to add .bak")
             os.rename(ddpm_ckpt_path, ddpm_ckpt_path + ".bak")
 
+        resume_ckpt_path = None
         if os.path.exists(ddpm_ckpt_path):
             print(f"[DDPM {mode.upper()}] Found existing checkpoint: {ddpm_ckpt_path}")
             try:
@@ -123,17 +124,31 @@ if __name__ == "__main__":
                     _test_ddpm.load_state_dict(_test_state)
                     
                 print(f"[DDPM {mode.upper()}] Successfully loaded existing checkpoint (architecture matched).")
-                skip_ddpm_train = True
+                
+                # Interactive prompt for the user
+                user_input = input(f"[DDPM {mode.upper()}] Do you want to skip training and proceed to inference? [Y/n]: ").strip().lower()
+                if user_input == 'n':
+                    skip_ddpm_train = False
+                    resume_ckpt_path = ddpm_ckpt_path
+                    print(f"[DDPM {mode.upper()}] Will resume training from {ddpm_ckpt_path}...")
+                else:
+                    skip_ddpm_train = True
+                    resume_ckpt_path = None
             except Exception as e:
                 print(f"\n[DDPM {mode.upper()}] !! Architecture Mismatch or Corrupted Checkpoint !!")
                 print(f"Error details: {e}")
                 print(f"Renaming old DDPM checkpoint to .bak and restarting training...")
                 os.rename(ddpm_ckpt_path, ddpm_ckpt_path + ".bak")
+                resume_ckpt_path = None
 
         if skip_ddpm_train:
             print(f"[DDPM {mode.upper()}] Skipping training...")
         else:
-            print(f"[DDPM {mode.upper()}] Start training...")
+            if resume_ckpt_path:
+                print(f"[DDPM {mode.upper()}] Resuming training...")
+            else:
+                print(f"[DDPM {mode.upper()}] Start NEW training...")
+                
             vae.eval()
             tr_latent_paths = [p.replace("_dispersion.npz", "_vae_latent.npz") for p in train_paths]
             va_latent_paths = [p.replace("_dispersion.npz", "_vae_latent.npz") for p in valid_paths]
@@ -143,7 +158,7 @@ if __name__ == "__main__":
                 vae_decoder=vae.decoder,
                 train_paths=tr_latent_paths,
                 valid_paths=va_latent_paths,
-                resume_path=None
+                resume_path=resume_ckpt_path
             )
             print(f"[DDPM {mode.upper()}] Training finished. checkpoint: {ddpm_ckpt_path}")
 

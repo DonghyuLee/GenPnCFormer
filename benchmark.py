@@ -6,6 +6,7 @@ import argparse
 import time
 from config import CFG, device
 from diffusion import DiffusionTransformer, UNet1D
+from eval import run_inference_and_evaluation
 try:
     from thop import profile
     THOP_AVAILABLE = True
@@ -112,7 +113,7 @@ def measure_efficiency(cfg, mode, device):
         "memory": max_mem
     }
 
-from eval import run_inference_and_evaluation
+
 
 def measure_quality(cfg, mode, device):
     print(f"\n--- Measuring Quality for {mode.upper()} ---")
