@@ -4,7 +4,7 @@ import numpy as np
 from config import CFG, device
 from data_utils import load_or_build_cache_multimat
 from vae import train_vae, build_vae_latent_cache, ConditionalVAE
-from diffusion import train_latent_diffusion
+from diffusion import train_latent_diffusion, DiffusionTransformer, UNet1D, DDPM
 from eval import run_inference_and_evaluation, visualize_dispersion_comparison, compare_condition_vs_surrogate_truth
 from benchmark import measure_efficiency
 import matplotlib.pyplot as plt
@@ -88,15 +88,8 @@ if __name__ == "__main__":
         
         # Override config for the current mode
         cfg.cond_mode = mode
-        if mode == "hybrid":
-            cfg.transformer_width = 128
-            cfg.transformer_depth = 4
-        elif mode in ["adaln", "adaln-zero"]:
-            cfg.transformer_width = 128
-            cfg.transformer_depth = 5 
-        elif mode == "mhca":
-            cfg.transformer_width = 128
-            cfg.transformer_depth = 6 
+        cfg.transformer_width = 128
+        cfg.transformer_depth = 4
 
         cfg.save_dir = f"{base_save_dir}_{mode}"
         os.makedirs(cfg.save_dir, exist_ok=True)
@@ -105,12 +98,41 @@ if __name__ == "__main__":
         out_name = f"ddpm_{getattr(cfg, 'diffusion_backbone', 'transformer')}_best.pt"
         ddpm_ckpt_path = os.path.join(cfg.save_dir, out_name)
 
+        skip_ddpm_train = False
         if not skip_vae_train and os.path.exists(ddpm_ckpt_path):
-            print(f"[DDPM {mode.upper()}] VAE was retrained. Removing old DDPM checkpoint: {ddpm_ckpt_path}")
-            os.remove(ddpm_ckpt_path)
+            print(f"[DDPM {mode.upper()}] VAE was retrained. Renaming old DDPM checkpoint to add .bak")
+            os.rename(ddpm_ckpt_path, ddpm_ckpt_path + ".bak")
 
         if os.path.exists(ddpm_ckpt_path):
             print(f"[DDPM {mode.upper()}] Found existing checkpoint: {ddpm_ckpt_path}")
+            try:
+                backbone_type = getattr(cfg, "diffusion_backbone", "transformer")
+                if backbone_type == "transformer":
+                    _test_model = DiffusionTransformer(
+                        latent_dim=cfg.latent_dim, width=cfg.transformer_width,
+                        depth=cfg.transformer_depth, heads=cfg.transformer_heads,
+                        dropout=cfg.dropout, cfg=cfg
+                    )
+                else:
+                    _test_model = UNet1D(cfg.latent_dim, cfg.unet_width, cfg.unet_depth, cfg.dropout, cfg)
+                
+                _test_ddpm = DDPM(_test_model, cfg.timesteps, cfg.beta_start, cfg.beta_end)
+                _test_state = torch.load(ddpm_ckpt_path, map_location='cpu', weights_only=True)
+                
+                if "ddpm" in _test_state:
+                    _test_ddpm.load_state_dict(_test_state["ddpm"])
+                else:
+                    _test_ddpm.load_state_dict(_test_state)
+                    
+                print(f"[DDPM {mode.upper()}] Successfully loaded existing checkpoint (architecture matched).")
+                skip_ddpm_train = True
+            except Exception as e:
+                print(f"\n[DDPM {mode.upper()}] !! Architecture Mismatch or Corrupted Checkpoint !!")
+                print(f"Error details: {e}")
+                print(f"Renaming old DDPM checkpoint to .bak and restarting training...")
+                os.rename(ddpm_ckpt_path, ddpm_ckpt_path + ".bak")
+
+        if skip_ddpm_train:
             print(f"[DDPM {mode.upper()}] Skipping training...")
         else:
             print(f"[DDPM {mode.upper()}] Start training...")

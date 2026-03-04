@@ -9,6 +9,7 @@ from vae import VAE_Decoder
 from diffusion import DDPM, DiffusionTransformer, UNet1D
 from eval import SurrogateBandSolver, unscale_from_tanh, TestDataset
 from data_utils import visualize_sample_paper
+from surrogate.models.pncformer import PnCFormer
 
 def build_scenario_masks(k_points=500, f_start=100.0, f_step=100.0):
     """
@@ -141,8 +142,6 @@ def run_inverse_design(cfg, mode="adaln-zero"):
 
     # 3. Load Surrogate Solver
     surrogate_solver = SurrogateBandSolver(cfg, device)
-    # Expose underlying models for full visualization
-    from surrogate.models.pncformer import PnCFormer
     base_dir = getattr(cfg, "surrogate_model_dir", "./surrogate/best_model")
     udr_model = PnCFormer(
         x_input_dim=6, f_input_dim=1,

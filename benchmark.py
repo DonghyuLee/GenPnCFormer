@@ -130,7 +130,7 @@ def measure_quality(cfg, mode, device):
     # ---------------------------------------------------------
     if mode == "hybrid":
         cfg.transformer_width = 128
-        cfg.transformer_depth = 4
+        cfg.transformer_depth = 5
     elif mode in ["adaln", "adaln-zero"]:
         cfg.transformer_width = 128
         cfg.transformer_depth = 5
