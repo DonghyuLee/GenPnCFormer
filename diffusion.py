@@ -28,7 +28,7 @@ class SinusoidalTimeEmbedding(nn.Module):
             emb = F.pad(emb, (0, 1), "constant", 0)
         return emb
 
-class FiLM(nn.Module):
+class AdaLN(nn.Module):
     """ Feature-wise Linear Modulation (수정 없음) """
     def __init__(self, cond_dim: int, width: int):
         super().__init__()
@@ -84,22 +84,22 @@ class CrossAttention(nn.Module):
         return self.to_out(out)
 
 # ==============================================================================
-# ⬇️ [대체] ResBlock1D -> AttnResBlock1D (FiLM + Attention)
+# ⬇️ [대체] ResBlock1D -> AttnResBlock1D (AdaLN + Attention)
 # ==============================================================================
 
 class AttnResBlock1D(nn.Module):
     """ 
-    1D Residual Block (FiLM + Cross-Attention 하이브리드)
-    - FiLM: 전역 조건 (t, mat, n_cells)
+    1D Residual Block (AdaLN + Cross-Attention 하이브리드)
+    - AdaLN: 전역 조건 (t, mat, n_cells)
     - Attention: 순차 조건 (band_mask)
     """
-    def __init__(self, width: int, film_dim: int, context_dim: int, dropout: float, n_heads: int = 4):
+    def __init__(self, width: int, adaln_dim: int, context_dim: int, dropout: float, n_heads: int = 4):
         super().__init__()
         self.norm1 = nn.GroupNorm(8, width)
         self.conv1 = nn.Conv1d(width, width, 3, padding=1)
         
-        # FiLM (전역 조건용)
-        self.film = FiLM(film_dim, width) 
+        # AdaLN (전역 조건용)
+        self.adaln = AdaLN(adaln_dim, width) 
         
         # Attention (순차 조건용)
         head_dim = width // n_heads
@@ -110,13 +110,13 @@ class AttnResBlock1D(nn.Module):
         self.conv2 = nn.Conv1d(width, width, 3, padding=1)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x, film_vec, context_vec):
+    def forward(self, x, adaln_vec, context_vec):
         # x: [B, C, L] (U-Net 피처)
-        # film_vec: [B, film_dim] (t, mat, n_cells)
+        # adaln_vec: [B, adaln_dim] (t, mat, n_cells)
         # context_vec: [B, K, context_dim] (band_mask 시퀀스)
 
-        # 1. FiLM 파라미터 준비
-        gamma, beta = self.film(film_vec)
+        # 1. AdaLN 파라미터 준비
+        gamma, beta = self.adaln(adaln_vec)
         
         # 2. 1차 Conv
         h = self.conv1(F.silu(self.norm1(x))) # [B, C, L]
@@ -135,7 +135,7 @@ class AttnResBlock1D(nn.Module):
         # 3d. 다시 [B, L, C] -> [B, C, L]
         h = h_attn.permute(0, 2, 1)
 
-        # 4. FiLM 적용 (Attention 이후)
+        # 4. AdaLN 적용 (Attention 이후)
         h = h * (1 + gamma.unsqueeze(-1)) + beta.unsqueeze(-1)
         
         # 5. 2차 Conv
@@ -256,15 +256,15 @@ class UNet1D(nn.Module):
         self.spatial = 16; self.in_ch = width; self.width = width
         d_cond_mat = 4 # E1, rho1, E2, rho2
         
-        # 1. 전역(FiLM) 조건부 정의
+        # 1. 전역(AdaLN) 조건부 정의
         self.time_emb = SinusoidalTimeEmbedding(width)
         self.material_proj = nn.Sequential(nn.Linear(d_cond_mat, width), nn.SiLU())
         self.ncells_embed = nn.Embedding(cfg.max_cells + 1, width)
         
-        # 💡 FiLM 조건(t, mat, ncells)을 위한 최종 프로젝션
-        film_dim_in = width * 3 
-        film_dim_out = width # ResBlock에 전달될 최종 FiLM 벡터 차원
-        self.film_proj = nn.Linear(film_dim_in, film_dim_out)
+        # 💡 AdaLN 조건(t, mat, ncells)을 위한 최종 프로젝션
+        adaln_dim_in = width * 3 
+        adaln_dim_out = width # ResBlock에 전달될 최종 AdaLN 벡터 차원
+        self.adaln_proj = nn.Linear(adaln_dim_in, adaln_dim_out)
         
         # 2. 순차(Attention) 조건부 정의
         context_dim = width # 밴드 마스크 시퀀스의 차원
@@ -275,12 +275,12 @@ class UNet1D(nn.Module):
         
         # 💡 신규 AttnResBlock1D 사용
         self.downs = nn.ModuleList([
-            AttnResBlock1D(width, film_dim_out, context_dim, dropout) for _ in range(depth)
+            AttnResBlock1D(width, adaln_dim_out, context_dim, dropout) for _ in range(depth)
         ])
         self.pools = nn.ModuleList([nn.AvgPool1d(2) for _ in range(depth)])
-        self.mid = AttnResBlock1D(width, film_dim_out, context_dim, dropout)
+        self.mid = AttnResBlock1D(width, adaln_dim_out, context_dim, dropout)
         self.ups = nn.ModuleList([
-            AttnResBlock1D(width, film_dim_out, context_dim, dropout) for _ in range(depth)
+            AttnResBlock1D(width, adaln_dim_out, context_dim, dropout) for _ in range(depth)
         ])
         self.upsample = nn.ModuleList([nn.Upsample(scale_factor=2, mode='nearest') for _ in range(depth)])
         self.outp = nn.Linear(self.in_ch * self.spatial, latent_dim)
@@ -289,46 +289,46 @@ class UNet1D(nn.Module):
         B = z_noisy.size(0)
         x = self.inp(z_noisy).view(B, self.in_ch, self.spatial)
         
-        # 1. (신규) FiLM 조건 벡터 'film_vec' 생성
+        # 1. (신규) AdaLN 조건 벡터 'adaln_vec' 생성
         t_emb = self.time_emb(t)
         mat_vec = self.material_proj(material_conds)
         ncells_vec = self.ncells_embed(n_cells)
         
         # 💡 밴드 마스크(band_mask_vec)는 여기서 제외
         h = torch.cat([t_emb, mat_vec, ncells_vec], dim=-1) # [B, 3*width]
-        film_vec = F.silu(self.film_proj(h)) # Final FiLM Cond Vec [B, film_dim_out]
+        adaln_vec = F.silu(self.adaln_proj(h)) # Final AdaLN Cond Vec [B, adaln_dim_out]
         
         # 2. (신규) Cross-Attention 컨텍스트 벡터 'context_vec' 생성
         context_vec = self.band_mask_enc(band_mask) # [B, K, context_dim]
         
-        # 3. U-Net 본체 (film_vec와 context_vec를 모두 전달)
+        # 3. U-Net 본체 (adaln_vec와 context_vec를 모두 전달)
         feats = []; 
         for d in range(len(self.downs)):
-            x = self.downs[d](x, film_vec, context_vec)
+            x = self.downs[d](x, adaln_vec, context_vec)
             feats.append(x)
             x = self.pools[d](x)
         
-        x = self.mid(x, film_vec, context_vec)
+        x = self.mid(x, adaln_vec, context_vec)
         
         for d in reversed(range(len(self.ups))):
             x = self.upsample[d](x)
             if x.size(-1) != feats[d].size(-1): x = F.pad(x, (0, feats[d].size(-1) - x.size(-1)))
             x = x + feats[d]
-            x = self.ups[d](x, film_vec, context_vec)
+            x = self.ups[d](x, adaln_vec, context_vec)
             
 class DiffusionTransformer(nn.Module):
     """
     DiT-style Transformer Backbone for 1D Latent Diffusion
     - Input: Noisy Latent z_t [B, latent_dim]
     - Conditions: t, mat, n_cells, band_mask
-    - Modes: 'hybrid' (default), 'concat', 'film', 'mhca'
+    - Modes: 'concat', 'adaln', 'adaln-zero', 'mhca'
     """
     def __init__(self, latent_dim: int, width: int, depth: int, heads: int, dropout: float, cfg: Any):
         super().__init__()
         
         self.width = width # 128
         self.latent_dim = latent_dim
-        self.cond_mode = getattr(cfg, "cond_mode", "hybrid")
+        self.cond_mode = getattr(cfg, "cond_mode", "adaln-zero")
         print(f"[DiffusionTransformer] Conditioning Mode: {self.cond_mode.upper()}")
         
         # 1. Input Projection (z -> Tokens)
@@ -360,39 +360,40 @@ class DiffusionTransformer(nn.Module):
         
         # 5. Determine Block Configuration based on Mode
         use_cross_attn = True
-        use_film = True
-        film_input_dim = width * 3 # Default Hybrid: t(1) + mat(1) + n(1) = 3 tokens width
+        use_adaln = True
+        adaln_input_dim = width * 3 # Default Hybrid: t(1) + mat(1) + n(1) = 3 tokens width
         self.ctx_dim = enc_dim
         
         if self.cond_mode == "hybrid":
-            # Hybrid: FiLM(t, mat, n) & CrossAttn(mask)
+            # Hybrid: AdaLN(t, mat, n) & CrossAttn(mask)
             use_cross_attn = True
-            use_film = True
-            film_input_dim = width * 3
+            use_adaln = True
+            adaln_input_dim = width * 3
             
         elif self.cond_mode == "concat":
-            # Concat: FiLM(t), Concat(x, mat, n, mask)
+            # Concat: AdaLN(t), Concat(x, mat, n, mask)
             # CrossAttn not needed (SelfAttn handles interaction)
             use_cross_attn = False 
-            use_film = True 
-            film_input_dim = width # Only Time
+            use_adaln = True 
+            adaln_input_dim = width # Only Time
             
             # Note: We must project the encoder dimension to model width if they differ,
             # because we are concatenating to the main sequence.
             if enc_dim != width:
                 self.enc_proj = nn.Linear(enc_dim, width)
             
-        elif self.cond_mode == "film":
-            # FiLM: FiLM(t, mat, n, pooled_mask)
+        elif self.cond_mode in ["adaln", "adaln-zero"]:
+            # AdaLN: AdaLN(t, mat, n, pooled_mask)
             use_cross_attn = False
-            use_film = True
-            film_input_dim = width * 3 + enc_dim # t, mat, n, mask_vec
+            use_adaln = True
+            use_adaln_zero = (self.cond_mode == "adaln-zero")
+            adaln_input_dim = width * 3 + enc_dim # t, mat, n, mask_vec
             
         elif self.cond_mode == "mhca":
-            # MHCA: FiLM(t), CrossAttn(mat, n, mask)
+            # MHCA: AdaLN(t), CrossAttn(mat, n, mask)
             use_cross_attn = True
-            use_film = True
-            film_input_dim = width # Only Time
+            use_adaln = True
+            adaln_input_dim = width # Only Time
             
             # Context dimension might need unification if mat/n width != enc_dim
             # But currently mat/n are projected to 'width'. 
@@ -412,8 +413,9 @@ class DiffusionTransformer(nn.Module):
             TransformerDiffBlock(width, heads, dropout, 
                                  context_dim=self.ctx_dim, 
                                  use_cross_attn=use_cross_attn,
-                                 use_film=use_film,
-                                 film_input_dim=film_input_dim) 
+                                 use_adaln=use_adaln,
+                                 adaln_input_dim=adaln_input_dim,
+                                 use_adaln_zero=use_adaln_zero) 
             for _ in range(depth)
         ])
         
@@ -439,18 +441,12 @@ class DiffusionTransformer(nn.Module):
         mask_seq = self.band_mask_enc(band_mask) # [B, K, enc_dim]
         
         # 3. Construct Wrapper Inputs based on Mode
-        film_vec = None
+        adaln_vec = None
         context_vec = None
         
-        if self.cond_mode == "hybrid":
-            # FiLM: t, m, n
-            film_vec = torch.cat([t_vec, m_vec, n_vec], dim=-1) # [B, 3W]
-            # Context: mask_seq
-            context_vec = mask_seq
-            
-        elif self.cond_mode == "concat":
-            # FiLM: t only
-            film_vec = t_vec # [B, W]
+        if self.cond_mode == "concat":
+            # AdaLN: t only
+            adaln_vec = t_vec # [B, W]
             
             # Tokens: mat, n, mask
             # Expand m, n to sequence [B, 1, W]
@@ -467,18 +463,18 @@ class DiffusionTransformer(nn.Module):
             
             context_vec = None # No Cross Attn
             
-        elif self.cond_mode == "film":
+        elif self.cond_mode in ["adaln", "adaln-zero"]:
             # Pool Mask: Global Average Pooling
             mask_vec = mask_seq.mean(dim=1) # [B, enc_dim]
             
-            # FiLM: t, m, n, mask_vec
-            film_vec = torch.cat([t_vec, m_vec, n_vec, mask_vec], dim=-1) # [B, 3W + enc_dim]
+            # AdaLN: t, m, n, mask_vec
+            adaln_vec = torch.cat([t_vec, m_vec, n_vec, mask_vec], dim=-1) # [B, 3W + enc_dim]
             
             context_vec = None # No Cross Attn
             
         elif self.cond_mode == "mhca":
-            # FiLM: t only
-            film_vec = t_vec # [B, W]
+            # AdaLN: t only
+            adaln_vec = t_vec # [B, W]
             
             # Context: m, n, mask
             m_tok = m_vec.unsqueeze(1)
@@ -491,7 +487,7 @@ class DiffusionTransformer(nn.Module):
             
         # 4. Process Blocks
         for block in self.blocks:
-            x = block(x, film_vec, context_vec)
+            x = block(x, adaln_vec, context_vec)
             
         # 5. Output Handling
         # If Concat mode, we must slice x back to original sequence length (first seq_len tokens)
@@ -504,11 +500,12 @@ class DiffusionTransformer(nn.Module):
         return out
 
 class TransformerDiffBlock(nn.Module):
-    def __init__(self, width, heads, dropout, context_dim=None, use_cross_attn=True, use_film=True, film_input_dim=None):
+    def __init__(self, width, heads, dropout, context_dim=None, use_cross_attn=True, use_adaln=True, adaln_input_dim=None, use_adaln_zero=False):
         super().__init__()
         if context_dim is None: context_dim = width
         self.use_cross_attn = use_cross_attn
-        self.use_film = use_film
+        self.use_adaln = use_adaln
+        self.use_adaln_zero = use_adaln_zero
         
         # 1. Self Attention
         self.norm1 = nn.LayerNorm(width)
@@ -529,71 +526,81 @@ class TransformerDiffBlock(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # 4. FiLM (Adaptive Layer Norm like)
-        if self.use_film:
-            if film_input_dim is None:
-                # Default fallback
-                film_input_dim = width * 3 
-            
-            # Output: 3 norms (1, 2, 3) * 2 params (gamma, beta) = 6
-            # BUT: if cross attn is missing, we only have 2 norms (1, 3).
-            # If film is enabled but cross_attn is disabled, we generate params for norm1 and norm3.
+        # 4. AdaLN (Adaptive Layer Norm like)
+        if self.use_adaln:
+            if adaln_input_dim is None:
+                adaln_input_dim = width * 3 
             
             self.num_norms = 3 if self.use_cross_attn else 2
-            self.film = nn.Linear(film_input_dim, width * 2 * self.num_norms)
             
+            if self.use_adaln_zero:
+                # 3 params per norm (gamma, beta, alpha)
+                self.adaln = nn.Linear(adaln_input_dim, width * 3 * self.num_norms)
+            else:
+                # 2 params per norm (gamma, beta)
+                self.adaln = nn.Linear(adaln_input_dim, width * 2 * self.num_norms)
+                
             # Zero-init
-            nn.init.zeros_(self.film.weight)
-            nn.init.zeros_(self.film.bias)
+            nn.init.zeros_(self.adaln.weight)
+            nn.init.zeros_(self.adaln.bias)
         
-    def forward(self, x, film_vector=None, context=None):
+    def forward(self, x, adaln_vector=None, context=None):
         # x: [B, L, W]
         
-        # 0. FiLM Parameters
-        gammas = []
-        betas = []
+        # 0. AdaLN Parameters
+        gammas, betas, alphas = [], [], []
         
-        if self.use_film and film_vector is not None:
-            film_out = self.film(film_vector)
-            # Use torch.split instead of chunk to avoid PyTorch SymIntArrayRef bugs
-            chunk_size = film_out.size(-1) // (self.num_norms * 2)
-            chunks = torch.split(film_out, chunk_size, dim=-1)
-            # Regroup
-            for i in range(self.num_norms):
-                gammas.append(chunks[2*i])
-                betas.append(chunks[2*i+1])
+        if self.use_adaln and adaln_vector is not None:
+            adaln_out = self.adaln(adaln_vector)
+            if self.use_adaln_zero:
+                chunk_size = adaln_out.size(-1) // (self.num_norms * 3)
+                chunks = torch.split(adaln_out, chunk_size, dim=-1)
+                for i in range(self.num_norms):
+                    gammas.append(chunks[3*i])
+                    betas.append(chunks[3*i+1])
+                    alphas.append(chunks[3*i+2])
+            else:
+                chunk_size = adaln_out.size(-1) // (self.num_norms * 2)
+                chunks = torch.split(adaln_out, chunk_size, dim=-1)
+                for i in range(self.num_norms):
+                    gammas.append(chunks[2*i])
+                    betas.append(chunks[2*i+1])
         
-        # Helper: Apply FiLM (Modulate Norm)
-        def modulate(x, norm, idx):
-            out = norm(x)
-            if self.use_film and film_vector is not None:
-                g = gammas[idx]
-                b = betas[idx]
-                out = out * (1 + g.unsqueeze(1)) + b.unsqueeze(1)
-            return out
-        
-        norm_idx = 0
+        # Helper: Apply Modulate
+        def modulate(feat, norm_idx):
+            if self.use_adaln and adaln_vector is not None:
+                return feat * (1 + gammas[norm_idx].unsqueeze(1)) + betas[norm_idx].unsqueeze(1)
+            return feat
+
+        def gate(attn_feat, norm_idx):
+            if self.use_adaln_zero and adaln_vector is not None:
+                return attn_feat * alphas[norm_idx].unsqueeze(1)
+            return attn_feat
         
         # 1. Self Attn
-        h = modulate(x, self.norm1, norm_idx)
-        norm_idx += 1
-        
+        h = self.norm1(x)
+        h = modulate(h, 0)
         attn_out, _ = self.attn1(h, h, h)
+        attn_out = gate(attn_out, 0)
         x = x + attn_out
         
         # 2. Cross Attn
         if self.use_cross_attn:
-            h = modulate(x, self.norm2, norm_idx)
-            norm_idx += 1
-            
+            h = self.norm2(x)
+            h = modulate(h, 1)
             attn_out, _ = self.attn2(h, context, context)
+            attn_out = gate(attn_out, 1)
             x = x + attn_out
+            norm_idx_ffn = 2
+        else:
+            norm_idx_ffn = 1
         
         # 3. FFN
-        h = modulate(x, self.norm3, norm_idx)
-        # norm_idx += 1 (Last one)
-        
-        x = x + self.ffn(h)
+        h = self.norm3(x)
+        h = modulate(h, norm_idx_ffn)
+        ffn_out = self.ffn(h)
+        ffn_out = gate(ffn_out, norm_idx_ffn)
+        x = x + ffn_out
         
         return x
 
@@ -636,7 +643,7 @@ class DDPM(nn.Module):
         # 💡 [New] Unconditional Token = 3 (explicitly distinct from 0=Pass)
         null_band_mask = torch.full_like(band_mask, 3)
         
-        # 💡 FiLM 조건(mat, n_cells)은 그대로 전달하고, 
+        # 💡 AdaLN 조건(mat, n_cells)은 그대로 전달하고, 
         #    Attention 조건(band_mask)만 Null Token으로 교체
         eps_empty = self.model(x, t, null_band_mask, material_conds, n_cells)
         

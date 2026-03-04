@@ -77,9 +77,8 @@ if __name__ == "__main__":
     print("-----------------------\n")
 
     # 4) DDPM 학습 및 평가 파이프라인 (Multi-Mode 지원)
-    # modes = ["film", "mhca", "hybrid"]
-    # modes = [ "hybrid", "mhca"]
-    modes = ['film']
+    # modes = ["adaln", "adaln-zero", "mhca"]
+    modes = ['adaln-zero']
     base_save_dir = cfg.save_dir
 
     for mode in modes:
@@ -92,7 +91,7 @@ if __name__ == "__main__":
         if mode == "hybrid":
             cfg.transformer_width = 128
             cfg.transformer_depth = 4
-        elif mode == "film":
+        elif mode in ["adaln", "adaln-zero"]:
             cfg.transformer_width = 128
             cfg.transformer_depth = 5 
         elif mode == "mhca":
@@ -135,7 +134,6 @@ if __name__ == "__main__":
         # )
 
         # 6) 결과 시각화 
-        # if mode == "hybrid":
         vis_dir = f"vis_results_{mode}"
         visualize_dispersion_comparison(
             cfg, device, save_dir=vis_dir, w_cfg=5.0,

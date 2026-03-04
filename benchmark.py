@@ -19,7 +19,7 @@ def count_parameters(model):
 def measure_efficiency(cfg, mode, device):
     # 1. Setup Model
     # Helper to enforce mode in cfg temporarily
-    original_mode = getattr(cfg, "cond_mode", "hybrid")
+    original_mode = getattr(cfg, "cond_mode", "adaln-zero")
     original_width = cfg.transformer_width
     original_depth = cfg.transformer_depth
     
@@ -28,15 +28,9 @@ def measure_efficiency(cfg, mode, device):
     # ---------------------------------------------------------
     # 💡 Param Matching Logic
     # ---------------------------------------------------------
-    if mode == "hybrid":
-        cfg.transformer_width = 128
-        cfg.transformer_depth = 4
-    elif mode == "film":
-        cfg.transformer_width = 128
-        cfg.transformer_depth = 5
-    elif mode == "mhca":
-        cfg.transformer_width = 128
-        cfg.transformer_depth = 6
+    # All models use depth=4
+    cfg.transformer_width = 128
+    cfg.transformer_depth = 4
     
     print(f"[{mode.upper()}] Instantiating Model (W={cfg.transformer_width}, D={cfg.transformer_depth})...")
     
@@ -137,7 +131,7 @@ def measure_quality(cfg, mode, device):
     if mode == "hybrid":
         cfg.transformer_width = 128
         cfg.transformer_depth = 4
-    elif mode == "film":
+    elif mode in ["adaln", "adaln-zero"]:
         cfg.transformer_width = 128
         cfg.transformer_depth = 5
     elif mode == "mhca":
@@ -148,10 +142,9 @@ def measure_quality(cfg, mode, device):
 
     # Set save_dir logic matches train_comparison.py
     base_save_dir = "./checkpoints/v2.1.0" # Hardcoded base for now, should match config default
-    if mode != "hybrid":
-        cfg.save_dir = f"{base_save_dir}_{mode}"
-    else:
-        cfg.save_dir = f"{base_save_dir}_{mode}"
+    # Only output TSNE for unconditional / standard variants if needed
+    # (Previously skipping for 'hybrid', now can just run or skip conditionally if desired. Running by default)
+    cfg.save_dir = f"{base_save_dir}_{mode}"
         
     print(f"[{mode.upper()}] Loading from: {cfg.save_dir}")
     
@@ -188,8 +181,8 @@ def main():
     args = parser.parse_args()
     
     cfg = CFG()
-    modes = ["film", "mhca", "hybrid"]
-    # modes = ["film", "mhca"]
+    modes = ["adaln", "adaln-zero", "mhca"]
+    # modes = ["adaln", "mhca"]
     # modes = ["mhca"]
 
     results = []

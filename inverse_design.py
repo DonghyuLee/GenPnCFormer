@@ -103,7 +103,7 @@ def check_success(pred_mask, scenario, freqs):
         return True
 
 
-def run_inverse_design(cfg, mode="film"):
+def run_inverse_design(cfg, mode="adaln-zero"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n=========================================")
     print(f" Running Inverse Design ({mode.upper()}) ")
@@ -118,16 +118,9 @@ def run_inverse_design(cfg, mode="film"):
     vae_decoder.eval()
 
     # 2. Load Diffusion Model
-    cfg.cond_mode = mode
-    if mode == "hybrid":
-        cfg.transformer_width = 128
-        cfg.transformer_depth = 4
-    elif mode == "film":
-        cfg.transformer_width = 128
-        cfg.transformer_depth = 5 
-    elif mode == "mhca":
-        cfg.transformer_width = 128
-        cfg.transformer_depth = 6
+    # All models use depth=4
+    cfg.transformer_width = 128
+    cfg.transformer_depth = 4
         
     ddpm_dir = f"{cfg.save_dir}_{mode}"
     ddpm_ckpt_path = os.path.join(ddpm_dir, f"ddpm_{getattr(cfg, 'diffusion_backbone', 'transformer')}_best.pt")
@@ -313,4 +306,4 @@ def run_inverse_design(cfg, mode="film"):
 
 if __name__ == "__main__":
     cfg = CFG()
-    run_inverse_design(cfg, mode="film")
+    run_inverse_design(cfg, mode="adaln-zero")
