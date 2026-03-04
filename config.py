@@ -27,7 +27,7 @@ class CFG:
     
     # Model Config
     dropout: float = 0.00
-    batch_size: int = 512 
+    batch_size: int = 256 
     num_workers: int = 8 
     
     # VAE 
@@ -43,23 +43,23 @@ class CFG:
     diffusion_backbone: str = "transformer" # "unet" or "transformer"
     unet_width: int = 64
     unet_depth: int = 4
-    transformer_width: int = 128
-    transformer_depth: int = 4
-    transformer_heads: int = 4
+    transformer_width: int = 256
+    transformer_depth: int = 8
+    transformer_heads: int = 8
     
     # Encoder Config (BandMask)
-    encoder_dim: int = 64     
-    encoder_depth: int = 2    
+    encoder_dim: int = 128     
+    encoder_depth: int = 4    
     encoder_heads: int = 4    
     
     timesteps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 0.02
     defect_sample_weight: float = 3.0 
-    lr_diffusion: float = 2e-4 
-    warmup_epochs: int = 10 
+    lr_diffusion: float = 1e-4 
+    warmup_epochs: int = 2 
     curriculum_switch_epoch: int = 100 
     latent_scale_factor: float = 5.04 
-    epochs_diffusion: int = 300 
-    cond_mode: str = "hybrid" 
+    epochs_diffusion: int = 50 
+    cond_mode: str = "adaln-zero" 
    

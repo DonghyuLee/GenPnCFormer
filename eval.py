@@ -770,6 +770,9 @@ def visualize_dispersion_comparison(cfg, device,
         
         S_gen    = sdr_from_layers(layers_gen, f_t, valid_mask_gen)
         band_gen = band_from_layers(layers_gen, f_t, valid_mask_gen)
+        
+        # Apply Don't Care regions from conditioning mask to the generated prediction
+        band_gen[M_cond == 3] = 3
 
         # 4) Plotting
         # Left: Length Comparison, Middle: Band Mask, Right: Transmittance
@@ -818,6 +821,9 @@ def visualize_dispersion_comparison(cfg, device,
                     continue # Draw defects on top later
                 elif c == 1: 
                     col = (1.0, 0.8, 0.6) # Gap: Light Orange
+                    edge = 'none'; lw = 0.0
+                elif c == 3:
+                    col = "lightgray" # Don't Care
                     edge = 'none'; lw = 0.0
                 else: 
                     col = "white" # Pass

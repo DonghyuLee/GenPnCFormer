@@ -28,9 +28,7 @@ def measure_efficiency(cfg, mode, device):
     # ---------------------------------------------------------
     # 💡 Param Matching Logic
     # ---------------------------------------------------------
-    # All models use depth=4
-    cfg.transformer_width = 128
-    cfg.transformer_depth = 4
+    # All models use parameters defined in config.py
     
     print(f"[{mode.upper()}] Instantiating Model (W={cfg.transformer_width}, D={cfg.transformer_depth})...")
     
@@ -128,16 +126,6 @@ def measure_quality(cfg, mode, device):
     # ---------------------------------------------------------
     # 💡 Param Matching Logic (Must match train_comparison.py)
     # ---------------------------------------------------------
-    if mode == "hybrid":
-        cfg.transformer_width = 128
-        cfg.transformer_depth = 5
-    elif mode in ["adaln", "adaln-zero"]:
-        cfg.transformer_width = 128
-        cfg.transformer_depth = 5
-    elif mode == "mhca":
-        cfg.transformer_width = 128
-        cfg.transformer_depth = 6
-        
     print(f"[{mode.upper()}] Evaluation Config: W={cfg.transformer_width}, D={cfg.transformer_depth}")
 
     # Set save_dir logic matches train_comparison.py

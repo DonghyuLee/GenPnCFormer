@@ -88,8 +88,6 @@ if __name__ == "__main__":
         
         # Override config for the current mode
         cfg.cond_mode = mode
-        cfg.transformer_width = 128
-        cfg.transformer_depth = 4
 
         cfg.save_dir = f"{base_save_dir}_{mode}"
         os.makedirs(cfg.save_dir, exist_ok=True)

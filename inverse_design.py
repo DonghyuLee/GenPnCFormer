@@ -119,9 +119,6 @@ def run_inverse_design(cfg, mode="adaln-zero"):
     vae_decoder.eval()
 
     # 2. Load Diffusion Model
-    # All models use depth=4
-    cfg.transformer_width = 128
-    cfg.transformer_depth = 4
         
     ddpm_dir = f"{cfg.save_dir}_{mode}"
     ddpm_ckpt_path = os.path.join(ddpm_dir, f"ddpm_{getattr(cfg, 'diffusion_backbone', 'transformer')}_best.pt")
@@ -262,6 +259,7 @@ def run_inverse_design(cfg, mode="adaln-zero"):
                         
                         # Prepare mask for plotting
                         mask_np = pred_np[best_idx]
+                        mask_np[scenario["mask"] == 3] = 3 # Apply don't care to predicted mask like input mask
                         disp_colorized = np.where(mask_np == 0, udr_pred, np.nan)
                         
                         # Save Data
@@ -274,12 +272,17 @@ def run_inverse_design(cfg, mode="adaln-zero"):
                         
                         # Left: Target vs Predicted Band Mask
                         ax = axes[0]
-                        ax.fill_between(freqs, 0, 1, where=(scenario["mask"]==1), color="gray", alpha=0.3, label="Target Bandgap")
+                        ax.fill_betweenx(freqs, 0, np.pi, where=(scenario["mask"]==1), color="tab:red", alpha=0.2, label="Target Bandgap")
+                        ax.fill_betweenx(freqs, 0, np.pi, where=(scenario["mask"]==0), color="tab:blue", alpha=0.1, label="Target Pass")
+                        ax.fill_betweenx(freqs, 0, np.pi, where=(scenario["mask"]==3), color="gray", alpha=0.2, label="Don't Care")
                         for tgt in scenario["targets"]:
                             if scenario["type"] == "defect":
-                                ax.axvline(tgt, color='blue', linestyle='--', label=f"Target Defect ({tgt}kHz)")
+                                ax.axhline(tgt, color='green', linestyle='--', label=f"Target Defect ({tgt}kHz)")
                         
-                        ax.scatter(udr_pred, freqs, c=mask_np, cmap="coolwarm", s=5, label="Dispersion")
+                        # Custom colormap for discrete 0, 1, 2, 3
+                        from matplotlib.colors import ListedColormap
+                        cmap_discrete = ListedColormap(['tab:blue', 'tab:red', 'tab:green', 'lightgray'])
+                        ax.scatter(udr_pred, freqs, c=mask_np, cmap=cmap_discrete, vmin=-0.5, vmax=3.5, s=5, label="Dispersion")
                         ax.set_ylabel("Frequency (kHz)")
                         ax.set_xlabel("Dispersion (rad)")
                         ax.set_title(f"Target vs Predicted Mask\n{mat} - {nc} Cells")
@@ -287,7 +290,9 @@ def run_inverse_design(cfg, mode="adaln-zero"):
                         # Right: Transmittance
                         ax2 = axes[1]
                         ax2.plot(tr_pred, freqs, color="purple", linewidth=1.5, label="Predicted TR")
-                        ax2.fill_between(freqs, 0, 1, where=(scenario["mask"]==1), color="gray", alpha=0.3)
+                        ax2.fill_betweenx(freqs, 0, 1, where=(scenario["mask"]==1), color="tab:red", alpha=0.2)
+                        ax2.fill_betweenx(freqs, 0, 1, where=(scenario["mask"]==0), color="tab:blue", alpha=0.1)
+                        ax2.fill_betweenx(freqs, 0, 1, where=(scenario["mask"]==3), color="gray", alpha=0.2)
                         ax2.set_ylabel("Frequency (kHz)")
                         ax2.set_xlabel("Transmittance")
                         ax2.set_xlim(0, 1)

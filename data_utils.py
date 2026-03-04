@@ -205,13 +205,15 @@ def visualize_sample_paper(
     figsize=(6, 3),
     colors=dict(
         bandgap="#FFF2CC",      # 연노랑
+        pass_band="#E6F2FF",    # 연한 파랑 (Pass Band)
+        dont_care="#F2F2F2",    # 연한 회색 (Don't Care)
         uc_line="#004080",      # 진파랑
         sc_line="#8080FF",      # 연파랑
         frf_line="#666666",     # 회색
         defect_line="#CC0000",  # 빨강
     ),
     lw_uc=1.5, lw_sc=1.2, lw_frf=1.0, lw_defect=1.2,
-    alpha_gap=0.4,
+    alpha_gap=0.4, alpha_bg=0.3,
     title=None,
     show_legend=True,
     save_path=None, 
@@ -260,6 +262,10 @@ def visualize_sample_paper(
 
     for s, e in _regions(mask_row, 1):
         ax.axhspan(frequencies[s], frequencies[e], color=colors["bandgap"], alpha=alpha_gap, lw=0, zorder=-1)
+    for s, e in _regions(mask_row, 0):
+        ax.axhspan(frequencies[s], frequencies[e], color=colors["pass_band"], alpha=alpha_bg, lw=0, zorder=-1)
+    for s, e in _regions(mask_row, 3):
+        ax.axhspan(frequencies[s], frequencies[e], color=colors["dont_care"], alpha=alpha_bg, lw=0, zorder=-1)
 
     ax.plot(udr_row, frequencies, color=colors["uc_line"], lw=lw_uc, label="Unit cell", zorder=1)
     ax.plot(sdr_row, frequencies, color=colors["sc_line"], lw=lw_sc, ls="--", label="Supercell", zorder=1)
