@@ -163,10 +163,10 @@ if __name__ == "__main__":
             print(f"[DDPM {mode.upper()}] Training finished. checkpoint: {ddpm_ckpt_path}")
 
         # 5) 평가
-        # run_inference_and_evaluation(
-        #     cfg, device, min_width=0.0, w_cfg=5.0, ddim_steps=50, eta=0.0,
-        #     test_paths=test_paths, diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path
-        # )
+        run_inference_and_evaluation(
+            cfg, device, min_width=0.0, w_cfg=5.0, ddim_steps=50, eta=0.0,
+            test_paths=test_paths, diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path
+        )
 
         # 6) 결과 시각화 
         vis_dir = f"vis_results_{mode}"

@@ -146,10 +146,16 @@ def compute_bandmask_metrics(pred_mask: torch.Tensor,
     with torch.no_grad():
         pred = pred_mask.long()
         target = target_mask.long()
-        acc = (pred == target).float().mean().item()
+        valid_mask = (target != 3)  # Don't Care mask
 
-        pred_def = (pred == 2)
-        targ_def = (target == 2)
+        # Accuracy
+        if valid_mask.sum() > 0:
+            acc = (pred[valid_mask] == target[valid_mask]).float().mean().item()
+        else:
+            acc = 0.0
+
+        pred_def = (pred[valid_mask] == 2)
+        targ_def = (target[valid_mask] == 2)
         tp = (pred_def & targ_def).sum().item()
         fp = (pred_def & (~targ_def)).sum().item()
         fn = ((~pred_def) & targ_def).sum().item()
@@ -414,7 +420,6 @@ def run_inference_and_evaluation(cfg, device,
     test_dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=True)
 
     # --- Accumulators ---
-    total_band_acc = 0.0
     num_samples = 0
 
     # Bandgap (Class 1) Accumulators
@@ -477,9 +482,7 @@ def run_inference_and_evaluation(cfg, device,
         )  # [B, K]
 
         # ---- (1) Point-level Accuracy (Class agnostic) ----
-        # Using existing function just for ACC
-        p_metrics = compute_bandmask_metrics(band_mask_pred, band_mask)
-        total_band_acc += p_metrics["acc"] * B
+        # Removed overall accuracy as requested
         num_samples    += B
 
         # ---- (2) Bandgap (Class 1) - Interval IoU ----
@@ -519,14 +522,16 @@ def run_inference_and_evaluation(cfg, device,
         def_gt_count2   += def_m2["gt_intervals"]
         
         # Pbar string
-        pbar.set_postfix(acc=f"{(total_band_acc/num_samples):.4f}")
+        cur_bg_prec = bg_tp / (bg_tp + bg_fp + 1e-8)
+        cur_bg_rec  = bg_tp / (bg_tp + bg_fn + 1e-8)
+        cur_bg_f1   = 2 * cur_bg_prec * cur_bg_rec / (cur_bg_prec + cur_bg_rec + 1e-8) if (bg_tp + bg_fp + bg_fn) > 0 else 0.0
+        pbar.set_postfix(bg_f1=f"{cur_bg_f1:.4f}")
 
     if num_samples == 0:
         print("No test samples evaluated.")
         return
 
     # --- Summary ---
-    avg_acc = total_band_acc / num_samples
 
     # Bandgap Stats
     bg_prec = bg_tp / (bg_tp + bg_fp + 1e-8)
@@ -544,15 +549,14 @@ def run_inference_and_evaluation(cfg, device,
     def_f12   = 2 * def_prec2 * def_rec2 / (def_prec2 + def_rec2 + 1e-8) if (def_tp2 + def_fp2 + def_fn2) > 0 else 0.0
 
     print(f"\n--- Evaluation Finished (VAE+DDPM + Surrogate) ---")
-    print(f"[Point] Acc: {avg_acc:.4f}")
 
-    print(f"\n[Bandgap IoU (Class 1)] thr={BG_IOU_THR:.2f}")
+    print("\n[Metrics] 1) Bandgap (Class 1) - Only for samples with Target Bandgap")
     print(f"Precision:  {bg_prec:.4f}")
     print(f"Recall:     {bg_rec:.4f}")
     print(f"F1:         {bg_f1:.4f}")
     print(f"Mean IoU*:  {bg_mean_iou:.4f}")
 
-    print(f"\n[Defect Tolerance Accuracy (Class 2)] tol={DEF_TOL:.4f}")
+    print(f"\n[Metrics] 2) Defect (Class 2) - Only for samples with Target Defect")
     # Precision: val (TP/PredCount) - Wait, Prec = TP/(TP+FP), and TP+FP == PredCount (usually)
     # Yes, unless logic differs. def_pred_count should equal def_tp + def_fp.
     # Let's verify consistency. _greedy_match returns TP, FP. TP+FP = len(pred).
@@ -733,7 +737,7 @@ def visualize_dispersion_comparison(cfg, device,
         return model_sdr(X, f, src_key_padding_mask=padding_mask).squeeze(0).detach().cpu().numpy()
 
     # --- Helper for Single Sample Visualization ---
-    def _viz_one_sample(layers_np, freqs_np, M_cond, save_path):
+    def _viz_one_sample(layers_np, freqs_np, M_cond, save_path, fig=None, axes=None):
         # 1) Prepare Inputs
         n_cells_i = int(np.clip((layers_np[:, 2] > 0.0).sum(), 1, cfg.max_cells))
         mat_cond_arr = np.array([layers_np[0,0], layers_np[0,1],
@@ -777,7 +781,15 @@ def visualize_dispersion_comparison(cfg, device,
         # 4) Plotting
         # Left: Length Comparison, Middle: Band Mask, Right: Transmittance
         # Custom width ratios, e.g., similar horizontal length
-        fig, axes = plt.subplots(1, 3, figsize=(12, 3), gridspec_kw={'width_ratios': [1, 1, 1]})
+        if fig is None or axes is None:
+            fig, local_axes = plt.subplots(1, 3, figsize=(12, 3), gridspec_kw={'width_ratios': [1, 1, 1]})
+            axLen, axL, axR = local_axes
+        else:
+            axLen, axL, axR = axes
+            axLen.clear()
+            axL.clear()
+            axR.clear()
+            fig.texts.clear()
         
         # --- Pre-calc Lengths ---
         L_gt = layers_np[:, 2]; L_gt = L_gt[L_gt > 1e-6]
@@ -903,15 +915,18 @@ def visualize_dispersion_comparison(cfg, device,
         # --- Text: Design Parameters ---
         def fmt_arr(arr):
             return "[" + ", ".join([f"{x:.3f}" for x in arr]) + "]"
-        acc = np.mean(band_gen == M_cond) * 100
+        valid_m = (M_cond != 3)
+        acc = np.mean(band_gen[valid_m] == M_cond[valid_m]) * 100 if valid_m.sum() > 0 else 0.0
         param_str = f"GT: {fmt_arr(L_gt)}\nGen: {fmt_arr(L_gen)}\nAcc: {acc:.1f}%"
         
         fig.text(0.5, 0.02, param_str, ha='center', va='bottom', fontsize=8, family='monospace')
         # Increased wspace from 0.15 to 0.35 for wider spacing between graphs
         fig.subplots_adjust(wspace=0.35, hspace=0, left=0.05, right=0.95, top=0.95, bottom=0.25)
         
-        plt.savefig(save_path, dpi=300)
-        plt.close('all')
+        fig.savefig(save_path, dpi=300)
+        
+        if axes is None:
+            plt.close(fig)
 
     # --- Loop Logic ---
     structures = [400, 420, 430, 500, 520, 524, 530, 540, 600, 620, 624, 625, 630, 635, 
@@ -922,6 +937,9 @@ def visualize_dispersion_comparison(cfg, device,
     plt.rcParams.update({'font.size': 12, 'font.family': 'sans-serif'}) 
 
     print(f"Starting loop for {total_expected} images...")
+    
+    # Create a single figure to reuse
+    global_fig, global_axes = plt.subplots(1, 3, figsize=(12, 3), gridspec_kw={'width_ratios': [1, 1, 1]})
     
     # RESUME LOGIC
     TARGET_MAT = "CA"
@@ -961,7 +979,7 @@ def visualize_dispersion_comparison(cfg, device,
                 sys.stdout.flush()
 
                 try:
-                    _viz_one_sample(X_all[global_idx], F_all[global_idx], M_all[global_idx], save_path)
+                    _viz_one_sample(X_all[global_idx], F_all[global_idx], M_all[global_idx], save_path, fig=global_fig, axes=global_axes)
                     cnt_saved += 1
                     if cnt_saved % 10 == 0: # Print more frequently
                         print(f"Saved {mat_name}{struct_val}_{local_idx} ... ({cnt_saved} cumulative)")
@@ -1154,13 +1172,18 @@ def interval_iou_metrics_batch(pred_mask: torch.Tensor,
     all_matched_ious = []
     tot_pred_int = tot_gt_int = 0
 
-    pred_mask_np = pred_mask.detach().cpu().numpy()
+    pred_mask_np = pred_mask.detach().cpu().numpy().copy()
     gt_mask_np   = gt_mask.detach().cpu().numpy()
     freqs_np     = freqs.detach().cpu().numpy()
+    
+    # Ignore Don't Care (3) regions to prevent False Positives
+    pred_mask_np[gt_mask_np == 3] = 0
 
     for b in range(B):
-        pis = _mask_to_intervals_1d(freqs_np[b], pred_mask_np[b], target_val, min_width)
         gis = _mask_to_intervals_1d(freqs_np[b], gt_mask_np[b],   target_val, min_width)
+        if len(gis) == 0:
+            continue # Skip samples where ground truth does not contain the target feature
+        pis = _mask_to_intervals_1d(freqs_np[b], pred_mask_np[b], target_val, min_width)
         tp, fp, fn, matched_ious = _greedy_match_intervals(pis, gis, iou_thr=iou_thr)
         tot_tp += tp; tot_fp += fp; tot_fn += fn
         tot_pred_int += len(pis); tot_gt_int += len(gis)
@@ -1193,15 +1216,20 @@ def defect_tolerance_metrics_batch(pred_mask: torch.Tensor,
     tot_tp = tot_fp = tot_fn = 0
     tot_pred_int = tot_gt_int = 0
     
-    pred_mask_np = pred_mask.detach().cpu().numpy()
+    pred_mask_np = pred_mask.detach().cpu().numpy().copy()
     gt_mask_np   = gt_mask.detach().cpu().numpy()
     freqs_np     = freqs.detach().cpu().numpy()
+    
+    # Ignore Don't Care (3) regions to prevent False Positives
+    pred_mask_np[gt_mask_np == 3] = 0
     
     target_val = 2 # Defect
 
     for b in range(B):
-        pis = _mask_to_intervals_1d(freqs_np[b], pred_mask_np[b], target_val, min_width)
         gis = _mask_to_intervals_1d(freqs_np[b], gt_mask_np[b],   target_val, min_width)
+        if len(gis) == 0:
+            continue # Skip samples where ground truth does not contain the target feature
+        pis = _mask_to_intervals_1d(freqs_np[b], pred_mask_np[b], target_val, min_width)
         
         tp, fp, fn, _ = _match_intervals_tolerance(pis, gis, tol=tol)
         
@@ -1244,7 +1272,6 @@ def compare_condition_vs_surrogate_truth(
     # -------------------------
     # 누적 통계 (포인트 단위)
     # -------------------------
-    total_acc = 0.0
     total_prec = 0.0
     total_rec  = 0.0
     total_f1   = 0.0
@@ -1284,7 +1311,6 @@ def compare_condition_vs_surrogate_truth(
 
         # ---------- 포인트 단위 메트릭 ----------
         metrics = compute_bandmask_metrics(band_mask_truth, band_mask_cond)
-        total_acc += metrics["acc"] * B
         total_prec += metrics["defect_prec"] * B
         total_rec  += metrics["defect_rec"] * B
         total_f1   += metrics["defect_f1"] * B
@@ -1331,7 +1357,6 @@ def compare_condition_vs_surrogate_truth(
         return
 
     # ---------- 최종 집계 (포인트 단위) ----------
-    avg_acc = total_acc / num_samples
     avg_prec = total_prec / num_samples
     avg_rec  = total_rec  / num_samples
     avg_f1   = total_f1   / num_samples
@@ -1346,8 +1371,9 @@ def compare_condition_vs_surrogate_truth(
     i_mean_iou = (i_all_matched_ious_sum / i_tot_matched) if i_tot_matched > 0 else 0.0
 
     print("\n--- Condition vs Surrogate-Truth (band mask) ---")
-    print(f"Samples: {num_samples}")
-    print(f"[Point]   Acc:          {avg_acc:.4f}")
+    print(f"Total Test Samples: {num_samples}")
+    
+    print("\n[Metrics] 1) Bandgap (Class 1) - Only for samples with Target Bandgap")
     print(f"[Point]   Defect Prec:  {avg_prec:.4f}")
     print(f"[Point]   Defect Rec:   {avg_rec:.4f}")
     print(f"[Point]   Defect F1:    {avg_f1:.4f}")
