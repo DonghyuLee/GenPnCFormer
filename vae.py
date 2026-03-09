@@ -370,7 +370,7 @@ def train_vae(cfg, device, train_paths=None, valid_paths=None):
     tr_ds = ConcatDataset(tr_datasets)
     va_ds = ConcatDataset(va_datasets)
     
-    train_dl = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False)
+    train_dl = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False, drop_last=True)
     val_dl = DataLoader(va_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False)
 
     # 2. 모델 및 옵티마이저 (이전과 동일)

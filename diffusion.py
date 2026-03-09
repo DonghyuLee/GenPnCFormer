@@ -361,6 +361,7 @@ class DiffusionTransformer(nn.Module):
         # 5. Determine Block Configuration based on Mode
         use_cross_attn = True
         use_adaln = True
+        use_adaln_zero = False  # default: False (only True for "adaln-zero" mode)
         adaln_input_dim = width * 3 # Default Hybrid: t(1) + mat(1) + n(1) = 3 tokens width
         self.ctx_dim = enc_dim
         
@@ -911,7 +912,7 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
         shuffle = True
         print("[Sampler] Fallback to Random Shuffle (Weights calc failed).")
 
-    train_dl = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=shuffle, sampler=sampler, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False)
+    train_dl = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=shuffle, sampler=sampler, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False, drop_last=True)
     val_dl   = DataLoader(va_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False)
     
 

@@ -9,7 +9,13 @@ from eval import run_inference_and_evaluation, visualize_dispersion_comparison, 
 from benchmark import measure_efficiency
 import matplotlib.pyplot as plt
 
+
 if __name__ == "__main__":
+    # i9-13900KF: P-core 8개 × 2 HT = 16 논리 코어로 제한
+    # E-core(core 16~31)에서 libtorch_cpu.so 실행 시 segfault 방지
+    torch.set_num_threads(16)
+    torch.set_num_interop_threads(4)
+
     cfg = CFG()
     os.makedirs(cfg.save_dir, exist_ok=True)
 
