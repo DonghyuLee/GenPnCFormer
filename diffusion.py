@@ -171,7 +171,7 @@ class BandMaskCondEncoder(nn.Module):
             d_model=out_dim, nhead=nhead, dim_feedforward=4*out_dim,
             activation="gelu", batch_first=True, dropout=0.0
         )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers, enable_nested_tensor=False)
         
     def forward(self, band_mask: torch.Tensor):
         # band_mask: [B, K]
@@ -221,7 +221,7 @@ class BandMaskCondEncoder_DualConv(nn.Module):
             d_model=out_dim, nhead=nhead, dim_feedforward=4*out_dim,
             activation="gelu", batch_first=True, dropout=0.0
         )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers, enable_nested_tensor=False)
         
     def forward(self, band_mask: torch.Tensor):
         # band_mask: [B, K] (Values: 0, 1, 2)
@@ -720,6 +720,9 @@ class DDPM(nn.Module):
             noise = torch.randn_like(z) if t_prev >= 0 else 0.0
             z = torch.sqrt(alpha_bar_t_prev) * pred_x0 + dir_xt + sigma_t * noise
             
+            # Free intermediate tensors to prevent VRAM accumulation
+            del eps_c, eps_empty, eps, pred_x0, dir_xt, noise, tt, null_band_mask
+            
         return z           
 
 
@@ -908,8 +911,8 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
         shuffle = True
         print("[Sampler] Fallback to Random Shuffle (Weights calc failed).")
 
-    train_dl = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=shuffle, sampler=sampler, num_workers=getattr(cfg, "num_workers", 0), pin_memory=True)
-    val_dl   = DataLoader(va_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=True)
+    train_dl = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=shuffle, sampler=sampler, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False)
+    val_dl   = DataLoader(va_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False)
     
 
     # 💡 Model Selection

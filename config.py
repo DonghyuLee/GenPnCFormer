@@ -15,8 +15,8 @@ print("Device:", device)
 class CFG:
     # Common Config
     data_dir: str = "data"
-    cache_dir: str = "data/cache_v2.2.0"
-    save_dir: str = "./checkpoints/v2.2.0"
+    cache_dir: str = "data/cache_v2.3.0"
+    save_dir: str = "./checkpoints/v2.3.0"
     target_folders: list = ("CA", "SA", "TA", "AC", "AS", "AT") # 💡 Multi-Material Support
 
     # Data Config
@@ -24,11 +24,13 @@ class CFG:
     k_points: int = 500
     n_classes: int = 3
     max_cells: int = 14
+    # Multi-Bandgap: valid_runs >= 2일 때 1개만 선택할 확률 (0.5 = 50:50, 1.0 = 항상 single)
+    multi_bandgap_p_single: float = 0.5
     
     # Model Config
     dropout: float = 0.00
     batch_size: int = 256 
-    num_workers: int = 8 
+    num_workers: int = 0  # fork+CUDA 충돌 방지 (데이터가 RAM에 전적재되므로 속도 손실 없음)
     
     # VAE 
     latent_dim: int = 128
@@ -60,6 +62,6 @@ class CFG:
     warmup_epochs: int = 2 
     curriculum_switch_epoch: int = 100 
     latent_scale_factor: float = 5.04 
-    epochs_diffusion: int = 50 
+    epochs_diffusion: int = 100 
     cond_mode: str = "adaln-zero" 
    

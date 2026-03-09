@@ -63,7 +63,7 @@ class PnCFormer(nn.Module):
             dim_feedforward=d_model * 4,
             dropout=dropout, batch_first=True
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_encoder_layers)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_encoder_layers, enable_nested_tensor=False)
 
         self.f_embed = nn.Linear(f_input_dim, d_model)
         self.f_pos_enc = PositionalEncoding(d_model, dropout)

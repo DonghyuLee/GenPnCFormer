@@ -16,6 +16,8 @@ from data_utils import build_band_mask
 # surrogate (PnCFormer)
 from surrogate.models.pncformer import PnCFormer
 
+import gc
+
 
 # ==============================================================================
 # Utils: masks & padding
@@ -247,6 +249,12 @@ class SurrogateBandSolver:
         self.model_trans.eval()
         self.model_sdr.eval()
 
+        # Disable nested tensor on all TransformerEncoders to prevent
+        # C++ memory corruption segfault during long inference loops
+        for m in [self.model_udr, self.model_trans, self.model_sdr]:
+            if hasattr(m, 'encoder') and hasattr(m.encoder, 'layers'):
+                m.encoder.enable_nested_tensor = False
+
     def _load_weights(self, model, ckpt_path: str):
         try:
             state = torch.load(ckpt_path, map_location=self.device, weights_only=True)
@@ -320,7 +328,8 @@ class SurrogateBandSolver:
             u_i = udr_pred[i].detach().cpu().numpy()
             s_i = sdr_pred[i].detach().cpu().numpy()
             band_masks.append(build_band_mask(u_i, s_i).astype(np.int64)) # Pass (UDR, SDR)
-        return torch.from_numpy(np.stack(band_masks, 0)).to(self.device)
+        # Keep result on CPU — metrics only need numpy anyway
+        return torch.from_numpy(np.stack(band_masks, 0))
 
 
 # ==============================================================================
@@ -417,7 +426,7 @@ def run_inference_and_evaluation(cfg, device,
     print(f"[Eval] Loading test data from {len(paths)} files: { [os.path.basename(p) for p in paths] }")
     test_datasets = [TestDataset(p, cfg.max_cells) for p in paths]
     test_ds = ConcatDataset(test_datasets)
-    test_dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=True)
+    test_dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=False)
 
     # --- Accumulators ---
     num_samples = 0
@@ -438,7 +447,7 @@ def run_inference_and_evaluation(cfg, device,
     print(f"Sampling method: DDIM (steps={ddim_steps}, eta={eta})")
     
     # Parameters
-    BG_IOU_THR = 0.50
+    BG_IOU_THR = 0.70
     DEF_TOL    = 0.5000
     DEF_TOL2    = 0.1000
 
@@ -452,34 +461,42 @@ def run_inference_and_evaluation(cfg, device,
         freqs = batch["freqs"].to(device)                              # [B, K]
         B = material_conds.size(0)
 
-        # 1) DDPM → z (DDIM Sampling)
-        z_sampled = ddpm.sample_ddim(
-            B=B,
-            band_mask=band_mask,
-            material_conds=material_conds,
-            n_cells=n_cells,
-            z_dim=cfg.latent_dim,
-            device=device,
-            w=W_CFG,
-            ddim_steps=ddim_steps,
-            eta=eta
-        )
-        
-        # 💡 [Latent Scaling] Unscale before decoding
-        scale_factor = getattr(cfg, "latent_scale_factor", 1.0)
-        z_sampled = z_sampled / scale_factor
+        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+            # 1) DDPM → z (DDIM Sampling, fp16)
+            z_sampled = ddpm.sample_ddim(
+                B=B,
+                band_mask=band_mask,
+                material_conds=material_conds,
+                n_cells=n_cells,
+                z_dim=cfg.latent_dim,
+                device=device,
+                w=W_CFG,
+                ddim_steps=ddim_steps,
+                eta=eta
+            )
+            
+            # 💡 [Latent Scaling] Unscale before decoding
+            scale_factor = getattr(cfg, "latent_scale_factor", 1.0)
+            z_sampled = z_sampled / scale_factor
 
-        # 2) VAE Decoder → lengths ([-1,1]) → unscale
-        lengths_pred_scaled = vae_decoder(z_sampled, material_conds, n_cells)  # [B, L, 1]
-        lengths_pred_unscaled = unscale_from_tanh(lengths_pred_scaled)         # [B, L, 1]
+            # 2) VAE Decoder → lengths (fp16)
+            lengths_pred_scaled = vae_decoder(z_sampled, material_conds, n_cells)  # [B, L, 1]
+            lengths_pred_unscaled = unscale_from_tanh(lengths_pred_scaled)         # [B, L, 1]
 
-        # 3) Surrogate physics eval (MAIN): band mask 예측
+        # 3) Surrogate runs OUTSIDE autocast in fp32 to prevent TransformerDecoder
+        # fp16 memory_key_padding_mask=-inf crash (deterministic Segfault at batch ~386)
+        lengths_fp32 = lengths_pred_unscaled.float().detach()
+        material_conds_fp32 = material_conds.float()
         band_mask_pred = surrogate_solver(
-            lengths_pred_unscaled,
-            material_conds,
+            lengths_fp32,
+            material_conds_fp32,
             n_cells,
-            freqs,                      # [B,K]
-        )  # [B, K]
+            freqs,
+        )  # [B, K] — on CPU
+
+        # Sync CUDA before GC to prevent use-after-free on CUDA streams
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         # ---- (1) Point-level Accuracy (Class agnostic) ----
         # Removed overall accuracy as requested
@@ -526,6 +543,14 @@ def run_inference_and_evaluation(cfg, device,
         cur_bg_rec  = bg_tp / (bg_tp + bg_fn + 1e-8)
         cur_bg_f1   = 2 * cur_bg_prec * cur_bg_rec / (cur_bg_prec + cur_bg_rec + 1e-8) if (bg_tp + bg_fp + bg_fn) > 0 else 0.0
         pbar.set_postfix(bg_f1=f"{cur_bg_f1:.4f}")
+        
+        # Explicit VRAM cleanup to prevent OOM Segfault
+        del z_sampled, lengths_pred_scaled, lengths_pred_unscaled
+        del lengths_fp32, material_conds_fp32, band_mask_pred
+        del material_conds, n_cells, band_mask, freqs
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if num_samples == 0:
         print("No test samples evaluated.")

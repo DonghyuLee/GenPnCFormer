@@ -88,8 +88,8 @@ def train_one_model(model_type, target_key, cfg, device):
         print("No training data found.")
         return
 
-    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,  num_workers=0, pin_memory=True)
-    val_dl   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,  num_workers=0, pin_memory=False)
+    val_dl   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=False)
     
     # 2. Model
     model = PnCFormer(

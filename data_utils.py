@@ -458,24 +458,50 @@ def build_cache_multimat(cfg):
                         
                         # If there is at least one valid wide bandgap
                         if len(valid_runs) > 0:
-                            # Randomly pick one gap to preserve
-                            target_run_idx = np.random.randint(len(valid_runs))
-                            keep_start, keep_end = valid_runs[target_run_idx]
+                            p_single = getattr(cfg, "multi_bandgap_p_single", 0.5)
+                            
+                            # valid_runs >= 2이고 확률 분기에서 multi-gap이 선택된 경우
+                            use_multi = (len(valid_runs) >= 2) and (np.random.rand() >= p_single)
                             
                             # Create a new mask filled with 3 (Don't Care)
                             new_mask = np.full_like(curr_mask, 3, dtype=np.int8)
                             
-                            # Add 0-padding (Pass-band boundary constraint) 20 bins (2kHz) around the gap
-                            pad_start = max(0, keep_start - 20)
-                            pad_end = min(k_lim, keep_end + 1 + 20)
+                            if use_multi:
+                                # --- 2-gap 선택 ---
+                                chosen = np.random.choice(len(valid_runs), size=2, replace=False)
+                                # 주파수 순서로 정렬 (낮은 쪽 먼저)
+                                chosen_runs = sorted([valid_runs[chosen[0]], valid_runs[chosen[1]]], key=lambda r: r[0])
+                                
+                                for (keep_start, keep_end) in chosen_runs:
+                                    # Pass-band boundary constraint (앞뒤 20 bins 패딩)
+                                    pad_start = max(0, keep_start - 20)
+                                    pad_end   = min(k_lim, keep_end + 1 + 20)
+                                    new_mask[pad_start:keep_start]  = 0
+                                    new_mask[keep_end + 1:pad_end]  = 0
+                                    # Gap 구간 원래 레이블 복원 (덮어쓰기로 gap 내부 보존)
+                                    new_mask[keep_start:keep_end + 1] = curr_mask[keep_start:keep_end + 1]
+                                
+                                # 두 gap 사이 거리가 40 bins 미만이면 사이 구간도 Pass-band로
+                                between_start = chosen_runs[0][1] + 1
+                                between_end   = chosen_runs[1][0]
+                                if between_end - between_start < 40:
+                                    new_mask[between_start:between_end] = 0
+                            else:
+                                # --- 1-gap 선택 (기존 방식) ---
+                                target_run_idx = np.random.randint(len(valid_runs))
+                                keep_start, keep_end = valid_runs[target_run_idx]
+                                
+                                # Add 0-padding (Pass-band boundary constraint) 20 bins (2kHz) around the gap
+                                pad_start = max(0, keep_start - 20)
+                                pad_end = min(k_lim, keep_end + 1 + 20)
+                                
+                                # First, apply 0 to the padded region
+                                new_mask[pad_start:keep_start] = 0
+                                new_mask[keep_end+1:pad_end] = 0
+                                
+                                # Finally, restore the targeted gap and its defects
+                                new_mask[keep_start:keep_end+1] = curr_mask[keep_start:keep_end+1]
                             
-                            # First, apply 0 to the padded region
-                            new_mask[pad_start:keep_start] = 0
-                            new_mask[keep_end+1:pad_end] = 0
-                            
-                            # Finally, restore the targeted gap and its defects
-                            # This overrides any padding overlap if defects are on the extreme edge
-                            new_mask[keep_start:keep_end+1] = curr_mask[keep_start:keep_end+1]
                             M[i] = new_mask
                         else:
                             # If no gaps >= 5kHz exist, everything is Don't Care

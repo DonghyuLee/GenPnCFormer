@@ -169,47 +169,47 @@ if __name__ == "__main__":
         )
 
         # 6) 결과 시각화 
-        vis_dir = f"vis_results_{mode}"
-        visualize_dispersion_comparison(
-            cfg, device, save_dir=vis_dir, w_cfg=5.0,
-            diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path
-        )
+        # vis_dir = f"vis_results_{mode}"
+        # visualize_dispersion_comparison(
+        #     cfg, device, save_dir=vis_dir, w_cfg=5.0,
+        #     diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path
+        # )
 
     # 7) 전체 모드 Benchmarking (효율성 통합 비교)
 
-    print("\n--- Starting Benchmark (Efficiency) ---")
-    results = []
-    for m in modes:
-        res = measure_efficiency(cfg, m, device)
-        if res: results.append(res)
+    # print("\n--- Starting Benchmark (Efficiency) ---")
+    # results = []
+    # for m in modes:
+    #     res = measure_efficiency(cfg, m, device)
+    #     if res: results.append(res)
         
-    if results:
-        modes_labels = [r["mode"].upper() for r in results]
-        params = [r["params"]/1e6 for r in results]
-        flops = [r["flops"]/1e9 for r in results]
-        latency = [r["latency"]*1000 for r in results]
-        memory = [r["memory"] for r in results]
+    # if results:
+    #     modes_labels = [r["mode"].upper() for r in results]
+    #     params = [r["params"]/1e6 for r in results]
+    #     flops = [r["flops"]/1e9 for r in results]
+    #     latency = [r["latency"]*1000 for r in results]
+    #     memory = [r["memory"] for r in results]
         
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        axes[0,0].bar(modes_labels, params, color=['tab:blue', 'tab:orange', 'tab:green'])
-        axes[0,0].set_title("Parameters (M)")
-        axes[0,0].bar_label(axes[0,0].containers[0], fmt='%.2f')
+    #     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    #     axes[0,0].bar(modes_labels, params, color=['tab:blue', 'tab:orange', 'tab:green'])
+    #     axes[0,0].set_title("Parameters (M)")
+    #     axes[0,0].bar_label(axes[0,0].containers[0], fmt='%.2f')
         
-        if any(f > 0 for f in flops):
-            axes[0,1].bar(modes_labels, flops, color=['tab:blue', 'tab:orange', 'tab:green'])
-            axes[0,1].set_title("FLOPs (G) per Step")
-            axes[0,1].bar_label(axes[0,1].containers[0], fmt='%.2f')
-        else:
-            axes[0,1].text(0.5, 0.5, "FLOPs N/A", ha='center', va='center')
+    #     if any(f > 0 for f in flops):
+    #         axes[0,1].bar(modes_labels, flops, color=['tab:blue', 'tab:orange', 'tab:green'])
+    #         axes[0,1].set_title("FLOPs (G) per Step")
+    #         axes[0,1].bar_label(axes[0,1].containers[0], fmt='%.2f')
+    #     else:
+    #         axes[0,1].text(0.5, 0.5, "FLOPs N/A", ha='center', va='center')
         
-        axes[1,0].bar(modes_labels, latency, color=['tab:blue', 'tab:orange', 'tab:green'])
-        axes[1,0].set_title("Inference Latency (ms)")
-        axes[1,0].bar_label(axes[1,0].containers[0], fmt='%.1f')
+    #     axes[1,0].bar(modes_labels, latency, color=['tab:blue', 'tab:orange', 'tab:green'])
+    #     axes[1,0].set_title("Inference Latency (ms)")
+    #     axes[1,0].bar_label(axes[1,0].containers[0], fmt='%.1f')
         
-        axes[1,1].bar(modes_labels, memory, color=['tab:blue', 'tab:orange', 'tab:green'])
-        axes[1,1].set_title("Peak Memory (MB)")
-        axes[1,1].bar_label(axes[1,1].containers[0], fmt='%.1f')
+    #     axes[1,1].bar(modes_labels, memory, color=['tab:blue', 'tab:orange', 'tab:green'])
+    #     axes[1,1].set_title("Peak Memory (MB)")
+    #     axes[1,1].bar_label(axes[1,1].containers[0], fmt='%.1f')
         
-        plt.tight_layout()
-        plt.savefig("benchmark_results.png")
-        print(f"Benchmark efficiency plot saved to benchmark_results.png")
+    #     plt.tight_layout()
+    #     plt.savefig("benchmark_results.png")
+    #     print(f"Benchmark efficiency plot saved to benchmark_results.png")

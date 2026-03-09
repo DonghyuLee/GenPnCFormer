@@ -46,7 +46,7 @@ class VAE_Encoder(nn.Module):
             d_model=d_model, nhead=cfg.n_heads, batch_first=True,
             dim_feedforward=4*d_model, activation="gelu", dropout=cfg.dropout
         )
-        self.tr_enc = nn.TransformerEncoder(enc_layer, num_layers=cfg.n_layers)
+        self.tr_enc = nn.TransformerEncoder(enc_layer, num_layers=cfg.n_layers, enable_nested_tensor=False)
         
         # 💡 [Change] Materials are now PART of the input sequence, so we don't need separate projection here.
         
@@ -370,8 +370,8 @@ def train_vae(cfg, device, train_paths=None, valid_paths=None):
     tr_ds = ConcatDataset(tr_datasets)
     va_ds = ConcatDataset(va_datasets)
     
-    train_dl = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=getattr(cfg, "num_workers", 0), pin_memory=True)
-    val_dl = DataLoader(va_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=True)
+    train_dl = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False)
+    val_dl = DataLoader(va_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False)
 
     # 2. 모델 및 옵티마이저 (이전과 동일)
     model = ConditionalVAE(cfg).to(device)
@@ -452,7 +452,7 @@ def build_vae_latent_cache(split: str, cfg: Any, vae_model, device, paths: list)
         # 1. VAE 훈련에 사용된 것과 동일한 데이터셋 로드
         # (lengths, material_conds, N_cells 반환)
         dataset = VAEDataset(in_path, cfg.max_cells)
-        data_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=True)
+        data_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False)
         
         # 2. 원본 NPZ에서 'M' (band_mask) 로드
         try:
