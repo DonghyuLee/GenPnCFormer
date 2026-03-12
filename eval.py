@@ -249,11 +249,9 @@ class SurrogateBandSolver:
         self.model_trans.eval()
         self.model_sdr.eval()
 
-        # Disable nested tensor on all TransformerEncoders to prevent
-        # C++ memory corruption segfault during long inference loops
-        for m in [self.model_udr, self.model_trans, self.model_sdr]:
-            if hasattr(m, 'encoder') and hasattr(m.encoder, 'layers'):
-                m.encoder.enable_nested_tensor = False
+        # Note: enable_nested_tensor=False is already set in PnCFormer.__init__
+        # (pncformer.py line 66). The real segfault fix is in PnCFormer.forward:
+        # pass bool mask (not float -inf) to TransformerDecoder.memory_key_padding_mask.
 
     def _load_weights(self, model, ckpt_path: str):
         try:
@@ -461,20 +459,23 @@ def run_inference_and_evaluation(cfg, device,
         freqs = batch["freqs"].to(device)                              # [B, K]
         B = material_conds.size(0)
 
+        # 1) DDPM → z (DDIM Sampling)
+        # autocast 밖에서 fp32로 실행: DDIM 50 step × 2 forward 반복에서
+        # fp16 누적 오차가 Python 인터프리터 레벨 메모리 손상을 유발.
+        # (Surrogate가 같은 이유로 autocast 밖에 있는 것과 동일한 처치)
+        z_sampled = ddpm.sample_ddim(
+            B=B,
+            band_mask=band_mask,
+            material_conds=material_conds,
+            n_cells=n_cells,
+            z_dim=cfg.latent_dim,
+            device=device,
+            w=W_CFG,
+            ddim_steps=ddim_steps,
+            eta=eta
+        )
+
         with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
-            # 1) DDPM → z (DDIM Sampling, fp16)
-            z_sampled = ddpm.sample_ddim(
-                B=B,
-                band_mask=band_mask,
-                material_conds=material_conds,
-                n_cells=n_cells,
-                z_dim=cfg.latent_dim,
-                device=device,
-                w=W_CFG,
-                ddim_steps=ddim_steps,
-                eta=eta
-            )
-            
             # 💡 [Latent Scaling] Unscale before decoding
             scale_factor = getattr(cfg, "latent_scale_factor", 1.0)
             z_sampled = z_sampled / scale_factor
@@ -691,9 +692,11 @@ def visualize_dispersion_comparison(cfg, device,
     print(f"[Viz] Loading visualization data from {len(target_paths)} files (Fixed Order)...")
     
     X_list, M_list, F_list = [], [], []
-    for p in target_paths:
+    # 💡 Track which materials were successfully loaded and their sizes
+    loaded_materials = []  # (mat_name, n_samples) in load order
+    for mat, p in zip(materials, target_paths):
         if not os.path.exists(p):
-            print(f"[Warning] File not found: {p}. Filling with dummy or skipping?")
+            print(f"[Warning] File not found: {p}. Skipping material {mat}.")
             continue
         try:
             z = np.load(p)
@@ -707,16 +710,44 @@ def visualize_dispersion_comparison(cfg, device,
                 F = np.tile(np.linspace(0.0, np.pi, K, dtype=np.float32), (X.shape[0], 1))
             print(f"Loaded {os.path.basename(p)}: shape={X.shape}")
             X_list.append(X); M_list.append(M); F_list.append(F)
+            loaded_materials.append((mat, X.shape[0]))
         except Exception as e:
             print(f"Error loading {p}: {e}")
 
     if not X_list:
         print("[Viz] No data loaded."); return
 
-    X_all = np.concatenate(X_list, axis=0) # [168000, L, 3] etc
+    X_all = np.concatenate(X_list, axis=0)
     M_all = np.concatenate(M_list, axis=0)
     F_all = np.concatenate(F_list, axis=0)
     print(f"[Viz] Total samples loaded: {X_all.shape[0]}")
+
+    # Full structures list (matches sorted h5 filenames per material)
+    structures_all = [400, 420, 430, 500, 520, 524, 530, 540, 600, 620, 624, 625, 630, 635,
+                      640, 650, 700, 720, 724, 725, 726, 730, 735, 736, 740, 746, 750, 760]
+    BLOCK_SIZE = 2000  # Each h5 file contributes exactly 2000 test samples (20000 * 0.1)
+
+    # 💡 Build per-material structure->block mapping.
+    #    The cache is built by iterating sorted h5 files and concatenating their
+    #    test splits IN ORDER.  So block[i] = i-th h5 file's test samples.
+    #    If a file was skipped during cache build (e.g. SA760), the block count
+    #    is less than 28 — we detect this by comparing n_samples // BLOCK_SIZE.
+    mat_struct_map = {}  # mat_name -> list of (struct_val, global_start_idx)
+    cum_global = 0
+    for mat_name_l, n_samp in loaded_materials:
+        actual_n_blocks = n_samp // BLOCK_SIZE  # e.g. CA=28, SA=27
+        present_structs = structures_all[:actual_n_blocks]  # first N structs (sorted h5 order)
+        skipped = structures_all[actual_n_blocks:]          # trailing structs that were missing
+        if skipped:
+            print(f"[Viz] {mat_name_l}: {len(skipped)} file(s) missing from cache: "
+                  f"{[f'{mat_name_l}{s}' for s in skipped]}")
+        entries = []
+        for blk_i, sv in enumerate(present_structs):
+            entries.append((sv, cum_global + blk_i * BLOCK_SIZE))
+        mat_struct_map[mat_name_l] = entries
+        cum_global += n_samp
+        print(f"[Viz] {mat_name_l}: {actual_n_blocks} blocks × {BLOCK_SIZE} = {n_samp} samples "
+              f"(global offset {cum_global - n_samp})")
 
     # --- Helpers ---
     def zero_pad_layers(layers, valid_mask_1D):
@@ -954,69 +985,63 @@ def visualize_dispersion_comparison(cfg, device,
             plt.close(fig)
 
     # --- Loop Logic ---
-    structures = [400, 420, 430, 500, 520, 524, 530, 540, 600, 620, 624, 625, 630, 635, 
-                  640, 650, 700, 720, 724, 725, 726, 730, 735, 736, 740, 746, 750, 760]
-    
     cnt_saved = 0
-    total_expected = len(materials) * len(structures) * 20
-    plt.rcParams.update({'font.size': 12, 'font.family': 'sans-serif'}) 
+    plt.rcParams.update({'font.size': 12, 'font.family': 'sans-serif'})
 
-    print(f"Starting loop for {total_expected} images...")
-    
     # Create a single figure to reuse
     global_fig, global_axes = plt.subplots(1, 3, figsize=(12, 3), gridspec_kw={'width_ratios': [1, 1, 1]})
-    
-    # RESUME LOGIC
+
+    # RESUME LOGIC — skip materials/structures before these targets
     TARGET_MAT = "CA"
     TARGET_STRUCT = 400
-    
     mat_order = {m: i for i, m in enumerate(materials)}
-    struct_order = {s: i for i, s in enumerate(structures)}
+    struct_order = {s: i for i, s in enumerate(structures_all)}
 
-    for m_idx, mat_name in enumerate(materials):
+    for mat_name, entries in mat_struct_map.items():
         mat_dir = os.path.join(save_dir, mat_name)
         os.makedirs(mat_dir, exist_ok=True)
-        
-        # Skip materials before target
-        if mat_order[mat_name] < mat_order[TARGET_MAT]:
+
+        # RESUME: skip materials before target
+        if mat_order.get(mat_name, 0) < mat_order.get(TARGET_MAT, 0):
+            print(f"[Viz] Skipping {mat_name} (before {TARGET_MAT})")
             continue
-        
-        for s_idx, struct_val in enumerate(structures):
-            # If in target material, skip structures before target
+
+        for struct_val, block_start in entries:
+            # RESUME: skip structures before target (only in target material)
             if mat_name == TARGET_MAT and struct_order[struct_val] < struct_order[TARGET_STRUCT]:
                 continue
-            
-            block_start = (m_idx * 56000) + (s_idx * 2000)
-            
+
             for k in range(20):
-                # 20 samples spread out of 2000
-                local_idx = k * 100
-                global_idx = block_start + local_idx
-                
+                # Spread 20 samples evenly over the BLOCK_SIZE window
+                local_offset = k * (BLOCK_SIZE // 20)  # = k * 100 when BLOCK_SIZE=2000
+                global_idx = block_start + local_offset
+
                 if global_idx >= X_all.shape[0]:
-                    print(f"Skipping index {global_idx} (exceeds {X_all.shape[0]})")
+                    print(f"Skipping {mat_name}{struct_val}_{k:02d}: global_idx={global_idx} "
+                          f">= total={X_all.shape[0]}")
                     continue
-                
-                fname = f"{mat_name}{struct_val}_{local_idx}.png"
+
+                # File name: {MAT}{STRUCT}_{k:02d}.png  (k = 00..19)
+                fname = f"{mat_name}{struct_val}_{k:02d}.png"
                 save_path = os.path.join(mat_dir, fname)
-                
-                print(f"DEBUG: Starting {fname} (global={global_idx})")
+
+                print(f"DEBUG: {fname} <- global_idx={global_idx} "
+                      f"(block_start={block_start}, k={k}, offset={local_offset})")
                 sys.stdout.flush()
 
                 try:
-                    _viz_one_sample(X_all[global_idx], F_all[global_idx], M_all[global_idx], save_path, fig=global_fig, axes=global_axes)
+                    _viz_one_sample(X_all[global_idx], F_all[global_idx], M_all[global_idx],
+                                    save_path, fig=global_fig, axes=global_axes)
                     cnt_saved += 1
-                    if cnt_saved % 10 == 0: # Print more frequently
-                        print(f"Saved {mat_name}{struct_val}_{local_idx} ... ({cnt_saved} cumulative)")
+                    if cnt_saved % 20 == 0:
+                        print(f"Saved {cnt_saved} images (last: {fname})")
                         sys.stdout.flush()
                 except Exception as e:
-                    print(f"[Error] Failed to viz {mat_name}{struct_val} id={local_idx} (global={global_idx})")
-                    print(f"Reason: {e}")
+                    print(f"[Error] {fname} (global={global_idx}): {e}")
                     traceback.print_exc()
                     sys.stdout.flush()
-                    # Continue to next sample
 
-    print("Done.")
+    print(f"Done. Total saved: {cnt_saved}")
 
 
     # --------------------------------------------------------------------------------------

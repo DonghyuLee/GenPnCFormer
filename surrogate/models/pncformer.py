@@ -81,22 +81,28 @@ class PnCFormer(nn.Module):
         # Encoder
         x_emb = self.x_embed(x)
         x_emb = self.x_pos_enc(x_emb)
-        
-        # 💡 Fix: Handle padding mask correctly (True=Pad) and convert to float to avoid NestedTensor issues
-        if src_key_padding_mask is not None:
-            enc_pad = torch.zeros_like(src_key_padding_mask, dtype=x.dtype)
-            enc_pad = enc_pad.masked_fill(src_key_padding_mask, float('-inf'))
-        else:
-            enc_pad = None
 
-        memory = self.encoder(x_emb, src_key_padding_mask=enc_pad)
+        # 💡 Fix: Pass bool mask directly to both Encoder and Decoder.
+        # Previously, a float -inf mask was passed to TransformerDecoder's
+        # memory_key_padding_mask. When ALL tokens in a row are masked (-inf),
+        # softmax produces NaN, which corrupts the C++ kernel state and causes
+        # a segfault after hundreds of batches. PyTorch's bool mask path handles
+        # this case safely by clamping attention weights internally.
+        if src_key_padding_mask is not None:
+            # Ensure bool dtype — some callers pass float or uint8
+            bool_pad = src_key_padding_mask.bool()
+        else:
+            bool_pad = None
+
+        memory = self.encoder(x_emb, src_key_padding_mask=bool_pad)
 
         # Decoder
         f = f.unsqueeze(-1)                # (B, F, 1)
         f_emb = self.f_embed(f)
         f_emb = self.f_pos_enc(f_emb)
-        
-        # Note: memory_key_padding_mask for decoder cross-attention also takes float mask
-        dec = self.decoder(tgt=f_emb, memory=memory, memory_key_padding_mask=enc_pad)
+
+        # 💡 Fix: Use the same bool mask for decoder cross-attention.
+        # DO NOT use float -inf mask here — it causes NaN → segfault.
+        dec = self.decoder(tgt=f_emb, memory=memory, memory_key_padding_mask=bool_pad)
         out = self.fc_out(dec).squeeze(-1) # (B, F)
         return out

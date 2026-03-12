@@ -747,17 +747,23 @@ class EMA:
                 self.shadow[name] = new_average.clone()
 
     def apply_shadow(self, model):
+        # param.data = 는 storage pointer를 교체하므로 optimizer 참조가 무효화됨
+        # copy_() 는 기존 storage에 값만 덮어쓰므로 외부 참조가 계속 유효
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         for name, param in model.named_parameters():
             if param.requires_grad:
                 assert name in self.shadow
-                self.backup[name] = param.data
-                param.data = self.shadow[name]
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
 
     def restore(self, model):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         for name, param in model.named_parameters():
             if param.requires_grad:
                 assert name in self.backup
-                param.data = self.backup[name]
+                param.data.copy_(self.backup[name])
         self.backup = {}
         
     def state_dict(self):
@@ -963,8 +969,9 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
 
     trainable_params = list(ddpm.parameters())
     weight_decay = getattr(cfg, "weight_decay", 0.0)
-    # 💡 [Fix] Use fused=True for PyTorch 2.x AMP compatibility (avoids the state_steps tensor bug)
-    opt = torch.optim.AdamW(trainable_params, lr=cfg.lr_diffusion, weight_decay=weight_decay, fused=True)
+    # [Fix] fused=True는 PyTorch 2.5.x에서 GradScaler + LR Scheduler 조합 시
+    # state_steps 불일치 RuntimeError를 일으킴 → foreach=False로 교체 (VAE와 동일)
+    opt = torch.optim.AdamW(trainable_params, lr=cfg.lr_diffusion, weight_decay=weight_decay, foreach=False)
     
     # 💡 [New] Scheduler Setup (Native PyTorch to prevent AMP state_steps bug)
     num_training_steps = cfg.epochs_diffusion * len(train_dl)
