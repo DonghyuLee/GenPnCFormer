@@ -39,9 +39,10 @@ def zero_pad_layers(layers: torch.Tensor, valid_mask_1D: torch.Tensor) -> torch.
 # ==============================================================================
 
 class TestDataset(Dataset):
-    def __init__(self, npz_path: str, max_cells: int):
+    def __init__(self, npz_path: str, max_cells: int, mat_name: str = ""):
         print(f"Loading Test data from {npz_path}...")
         self.max_cells = max_cells
+        self.mat_name  = mat_name
 
         # safe defaults
         self.Y_lengths_true_scaled = np.zeros((0, self.max_cells, 1), dtype=np.float32)
@@ -114,6 +115,7 @@ class TestDataset(Dataset):
             "n_cells": torch.tensor(self.N_cells[idx], dtype=torch.long),              # []
             "band_mask": torch.from_numpy(self.M[idx]),                                # [K]
             "freqs": torch.from_numpy(self.F[idx]),                                    # [K]
+            "mat_name": self.mat_name,                                                 # str
         }
 
 
@@ -347,7 +349,6 @@ def run_inference_and_evaluation(cfg, device,
     1) DDPM 샘플링 → VAE 디코딩
     2) Surrogate(PnCFormer)로 band mask 예측
     3) condition band mask와 비교
-       - Point-level: Acc
        - Bandgap (Class 1): IoU metrics
        - Defect (Class 2): Tolerance metrics
     """
@@ -403,7 +404,6 @@ def run_inference_and_evaluation(cfg, device,
 
     # --- Data ---
     # test_paths must be passed or we iterate
-    # test_paths must be passed or we iterate
     if test_paths:
         paths = test_paths
     elif hasattr(cfg, "test_paths") and cfg.test_paths:
@@ -422,183 +422,179 @@ def run_inference_and_evaluation(cfg, device,
         paths = [os.path.join(cfg.cache_dir, "CA_test_with_mask.npz")]
 
     print(f"[Eval] Loading test data from {len(paths)} files: { [os.path.basename(p) for p in paths] }")
-    test_datasets = [TestDataset(p, cfg.max_cells) for p in paths]
-    test_ds = ConcatDataset(test_datasets)
-    test_dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=False)
+
+    # Build per-material dataset (keep mat_name tag)
+    mat_names_order = ["TA", "CA", "SA", "AT", "AC", "AS"]  # display order
+    def _mat_from_path(p):
+        base = os.path.basename(p)          # e.g. "CA_test_dispersion.npz"
+        return base.split("_")[0]           # → "CA"
+
+    test_datasets = [
+        TestDataset(p, cfg.max_cells, mat_name=_mat_from_path(p))
+        for p in paths
+    ]
 
     # --- Accumulators ---
-    num_samples = 0
+    num_samples  = 0
+    DMA_DELTA    = 0.5  # tolerance δ in frequency units (kHz)
 
-    # Bandgap (Class 1) Accumulators
-    bg_tp = bg_fp = bg_fn = 0
-    bg_matched = 0
-    bg_iou_sum = 0.0
+    # helper: empty sub-accumulator dict
+    def _acc():
+        return {"mbof_iou": 0.0, "mbof_n": 0, "dma_match": 0.0, "dma_n": 0}
 
-    # Defect (Class 2) Accumulators
-    def_tp = def_fp = def_fn = 0
-    def_tp2 = def_fp2 = def_fn2 = 0
-    def_pred_count = def_gt_count = 0
-    def_pred_count2 = def_gt_count2 = 0
+    # Total
+    acc_total = _acc()
+    # Per-material  (keys: mat name strings)
+    all_mats   = list({_mat_from_path(p) for p in paths})
+    acc_by_mat = {m: _acc() for m in all_mats}
+    # Per-n_cells  (keys: 4,5,6,7 → layers 8,10,12,14)
+    # n_cells in dataset = number of layers (AB pairs × 2), so cells=4 → n_cells=8
+    # Group by unit-cell count = n_cells // 2
+    acc_by_uc  = {uc: _acc() for uc in [4, 5, 6, 7]}
 
     W_CFG = getattr(cfg, "w_cfg_inference", w_cfg)
     print(f"Running inference with CFG scale (w) = {W_CFG}")
     print(f"Sampling method: DDIM (steps={ddim_steps}, eta={eta})")
-    
-    # Parameters
-    BG_IOU_THR = 0.70
-    DEF_TOL    = 0.5000
-    DEF_TOL2    = 0.1000
+    print(f"Metrics: mBOF (bandgap IoU)  |  DMA(δ={DMA_DELTA:.2f}) (defect accuracy)")
 
-    pbar = tqdm(test_dl, desc="[Inference & Eval]")
+    def _update_acc(acc, mbof_m, dma_m):
+        acc["mbof_iou"]   += mbof_m["iou_sum"]
+        acc["mbof_n"]     += mbof_m["n_samples"]
+        acc["dma_match"]  += dma_m["match_sum"]
+        acc["dma_n"]      += dma_m["n_samples"]
 
-    for batch in pbar:
-        # inputs
-        material_conds = batch["material_conds"].to(device)            # [B, 4]
-        n_cells = torch.clamp(batch["n_cells"].to(device), min=1)      # [B]
-        band_mask = batch["band_mask"].to(device)                      # [B, K]
-        freqs = batch["freqs"].to(device)                              # [B, K]
-        B = material_conds.size(0)
+    def _fmt(acc):
+        mbof = acc["mbof_iou"] / max(acc["mbof_n"], 1)
+        dma  = acc["dma_match"] / max(acc["dma_n"],  1)
+        return mbof, dma, acc["mbof_n"], acc["dma_n"]
 
-        # 1) DDPM → z (DDIM Sampling)
-        # autocast 밖에서 fp32로 실행: DDIM 50 step × 2 forward 반복에서
-        # fp16 누적 오차가 Python 인터프리터 레벨 메모리 손상을 유발.
-        # (Surrogate가 같은 이유로 autocast 밖에 있는 것과 동일한 처치)
-        z_sampled = ddpm.sample_ddim(
-            B=B,
-            band_mask=band_mask,
-            material_conds=material_conds,
-            n_cells=n_cells,
-            z_dim=cfg.latent_dim,
-            device=device,
-            w=W_CFG,
-            ddim_steps=ddim_steps,
-            eta=eta
-        )
+    # Iterate per-material dataset to keep mat_name accessible
+    total_batches = sum(
+        (len(ds) + cfg.batch_size - 1) // cfg.batch_size for ds in test_datasets
+    )
+    pbar = tqdm(total=total_batches, desc="[Inference & Eval]")
 
-        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
-            # 💡 [Latent Scaling] Unscale before decoding
-            scale_factor = getattr(cfg, "latent_scale_factor", 1.0)
-            z_sampled = z_sampled / scale_factor
+    for ds in test_datasets:
+        mat = ds.mat_name
+        dl  = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
+                         num_workers=0, pin_memory=False)
 
-            # 2) VAE Decoder → lengths (fp16)
-            lengths_pred_scaled = vae_decoder(z_sampled, material_conds, n_cells)  # [B, L, 1]
-            lengths_pred_unscaled = unscale_from_tanh(lengths_pred_scaled)         # [B, L, 1]
+        for batch in dl:
+            # inputs
+            material_conds = batch["material_conds"].to(device)       # [B, 4]
+            n_cells = torch.clamp(batch["n_cells"].to(device), min=1) # [B]
+            band_mask = batch["band_mask"].to(device)                 # [B, K]
+            freqs = batch["freqs"].to(device)                         # [B, K]
+            B = material_conds.size(0)
+            num_samples += B
 
-        # 3) Surrogate runs OUTSIDE autocast in fp32 to prevent TransformerDecoder
-        # fp16 memory_key_padding_mask=-inf crash (deterministic Segfault at batch ~386)
-        lengths_fp32 = lengths_pred_unscaled.float().detach()
-        material_conds_fp32 = material_conds.float()
-        band_mask_pred = surrogate_solver(
-            lengths_fp32,
-            material_conds_fp32,
-            n_cells,
-            freqs,
-        )  # [B, K] — on CPU
+            # 1) DDPM → z (DDIM Sampling)
+            z_sampled = ddpm.sample_ddim(
+                B=B,
+                band_mask=band_mask,
+                material_conds=material_conds,
+                n_cells=n_cells,
+                z_dim=cfg.latent_dim,
+                device=device,
+                w=W_CFG,
+                ddim_steps=ddim_steps,
+                eta=eta
+            )
 
-        # Sync CUDA before GC to prevent use-after-free on CUDA streams
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                scale_factor = getattr(cfg, "latent_scale_factor", 1.0)
+                z_sampled = z_sampled / scale_factor
+                lengths_pred_scaled   = vae_decoder(z_sampled, material_conds, n_cells)
+                lengths_pred_unscaled = unscale_from_tanh(lengths_pred_scaled)
 
-        # ---- (1) Point-level Accuracy (Class agnostic) ----
-        # Removed overall accuracy as requested
-        num_samples    += B
+            lengths_fp32 = lengths_pred_unscaled.float().detach()
+            material_conds_fp32 = material_conds.float()
+            band_mask_pred = surrogate_solver(
+                lengths_fp32, material_conds_fp32, n_cells, freqs,
+            )  # [B, K] — CPU
 
-        # ---- (2) Bandgap (Class 1) - Interval IoU ----
-        bg_m = interval_iou_metrics_batch(
-            pred_mask=band_mask_pred,
-            gt_mask=band_mask,
-            freqs=freqs,
-            target_val=1, # Class 1
-            iou_thr=BG_IOU_THR,
-            min_width=min_width,
-        )
-        bg_tp += bg_m["tp"]; bg_fp += bg_m["fp"]; bg_fn += bg_m["fn"]
-        bg_matched += bg_m["matched_pairs"]
-        bg_iou_sum += bg_m["mean_iou"] * bg_m["matched_pairs"]
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-        # ---- (3) Defect (Class 2) - Tolerance ----
-        def_m = defect_tolerance_metrics_batch(
-            pred_mask=band_mask_pred,
-            gt_mask=band_mask,
-            freqs=freqs,
-            tol=DEF_TOL,
-            min_width=min_width
-        )
-        def_tp += def_m["tp"]; def_fp += def_m["fp"]; def_fn += def_m["fn"]
-        def_pred_count += def_m["pred_intervals"]
-        def_gt_count   += def_m["gt_intervals"]
+            # ── mBOF + DMA (total) ────────────────────────────────────────
+            mbof_m = _mbof_batch(band_mask_pred, band_mask, freqs, min_width)
+            dma_m  = _dma_batch(band_mask_pred,  band_mask, freqs, DMA_DELTA, min_width)
 
-        def_m2 = defect_tolerance_metrics_batch(
-            pred_mask=band_mask_pred,
-            gt_mask=band_mask,
-            freqs=freqs,
-            tol=DEF_TOL2,
-            min_width=min_width
-        )
-        def_tp2 += def_m2["tp"]; def_fp2 += def_m2["fp"]; def_fn2 += def_m2["fn"]
-        def_pred_count2 += def_m2["pred_intervals"]
-        def_gt_count2   += def_m2["gt_intervals"]
-        
-        # Pbar string
-        cur_bg_prec = bg_tp / (bg_tp + bg_fp + 1e-8)
-        cur_bg_rec  = bg_tp / (bg_tp + bg_fn + 1e-8)
-        cur_bg_f1   = 2 * cur_bg_prec * cur_bg_rec / (cur_bg_prec + cur_bg_rec + 1e-8) if (bg_tp + bg_fp + bg_fn) > 0 else 0.0
-        pbar.set_postfix(bg_f1=f"{cur_bg_f1:.4f}")
-        
-        # Explicit VRAM cleanup to prevent OOM Segfault
-        del z_sampled, lengths_pred_scaled, lengths_pred_unscaled
-        del lengths_fp32, material_conds_fp32, band_mask_pred
-        del material_conds, n_cells, band_mask, freqs
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            _update_acc(acc_total,          mbof_m, dma_m)
+            _update_acc(acc_by_mat[mat],    mbof_m, dma_m)
+
+            # ── per-n_cells breakdown ─────────────────────────────────────
+            nc_np = n_cells.cpu().numpy()              # [B] layer count (8/10/12/14)
+            bm_cpu = band_mask.cpu()
+            freq_cpu = freqs.cpu()
+            bp_cpu   = band_mask_pred                  # already on CPU
+
+            for uc in [4, 5, 6, 7]:
+                layer_target = uc * 2                  # 4→8, 5→10, 6→12, 7→14
+                sel = (nc_np == layer_target)          # bool [B]
+                if not sel.any():
+                    continue
+                sel_t = torch.from_numpy(sel)
+                mbof_uc = _mbof_batch(
+                    bp_cpu[sel_t], bm_cpu[sel_t], freq_cpu[sel_t], min_width)
+                dma_uc  = _dma_batch(
+                    bp_cpu[sel_t], bm_cpu[sel_t], freq_cpu[sel_t], DMA_DELTA, min_width)
+                _update_acc(acc_by_uc[uc], mbof_uc, dma_uc)
+
+            # Progress bar
+            cur_mbof, cur_dma, _, _ = _fmt(acc_total)
+            pbar.set_postfix(mat=mat, mBOF=f"{cur_mbof:.4f}", DMA=f"{cur_dma:.4f}")
+            pbar.update(1)
+
+            # Explicit VRAM cleanup
+            del z_sampled, lengths_pred_scaled, lengths_pred_unscaled
+            del lengths_fp32, material_conds_fp32, band_mask_pred
+            del material_conds, n_cells, band_mask, freqs
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    pbar.close()
 
     if num_samples == 0:
         print("No test samples evaluated.")
         return
 
-    # --- Summary ---
+    # ── Print Results ──────────────────────────────────────────────────────
+    def _row(mbof, dma, mbof_n, dma_n):
+        return f"{mbof:.4f} (n={mbof_n:>6})   {dma:.4f} (n={dma_n:>6})"
 
-    # Bandgap Stats
-    bg_prec = bg_tp / (bg_tp + bg_fp + 1e-8)
-    bg_rec  = bg_tp / (bg_tp + bg_fn + 1e-8)
-    bg_f1   = 2 * bg_prec * bg_rec / (bg_prec + bg_rec + 1e-8) if (bg_tp + bg_fp + bg_fn) > 0 else 0.0
-    bg_mean_iou = (bg_iou_sum / bg_matched) if bg_matched > 0 else 0.0
-    
-    # Defect Stats
-    def_prec = def_tp / (def_tp + def_fp + 1e-8)
-    def_rec  = def_tp / (def_tp + def_fn + 1e-8)
-    def_f1   = 2 * def_prec * def_rec / (def_prec + def_rec + 1e-8) if (def_tp + def_fp + def_fn) > 0 else 0.0
+    sep  = "-" * 65
+    hdr  = f"{'':8s}  {'mBOF':>26s}   {'DMA(δ=0.50)':>26s}"
 
-    def_prec2 = def_tp2 / (def_tp2 + def_fp2 + 1e-8)
-    def_rec2  = def_tp2 / (def_tp2 + def_fn2 + 1e-8)
-    def_f12   = 2 * def_prec2 * def_rec2 / (def_prec2 + def_rec2 + 1e-8) if (def_tp2 + def_fp2 + def_fn2) > 0 else 0.0
+    print(f"\n{'='*65}")
+    print(f"  Evaluation Results   (total samples: {num_samples})")
+    print(f"{'='*65}")
 
-    print(f"\n--- Evaluation Finished (VAE+DDPM + Surrogate) ---")
+    # 1) By material
+    print(f"\n  [1] By Material")
+    print(hdr); print(sep)
+    for m in mat_names_order:
+        if m not in acc_by_mat:
+            continue
+        mbof, dma, mn, dn = _fmt(acc_by_mat[m])
+        print(f"  {m:<6s}    {_row(mbof, dma, mn, dn)}")
+    print(sep)
+    mbof_t, dma_t, mn_t, dn_t = _fmt(acc_total)
+    print(f"  {'Total':<6s}    {_row(mbof_t, dma_t, mn_t, dn_t)}")
 
-    print("\n[Metrics] 1) Bandgap (Class 1) - Only for samples with Target Bandgap")
-    print(f"Precision:  {bg_prec:.4f}")
-    print(f"Recall:     {bg_rec:.4f}")
-    print(f"F1:         {bg_f1:.4f}")
-    print(f"Mean IoU*:  {bg_mean_iou:.4f}")
+    # 2) By unit-cell count
+    print(f"\n  [2] By Unit-Cell Count")
+    print(hdr); print(sep)
+    for uc in [4, 5, 6, 7]:
+        mbof, dma, mn, dn = _fmt(acc_by_uc[uc])
+        print(f"  {uc} cells   {_row(mbof, dma, mn, dn)}")
+    print(sep)
+    print(f"  {'Total':<6s}    {_row(mbof_t, dma_t, mn_t, dn_t)}")
+    print(f"{'='*65}\n")
 
-    print(f"\n[Metrics] 2) Defect (Class 2) - Only for samples with Target Defect")
-    # Precision: val (TP/PredCount) - Wait, Prec = TP/(TP+FP), and TP+FP == PredCount (usually)
-    # Yes, unless logic differs. def_pred_count should equal def_tp + def_fp.
-    # Let's verify consistency. _greedy_match returns TP, FP. TP+FP = len(pred).
-    # So yes, PredCount = TP + FP.
-    print(f"Precision:  {def_prec:.4f} ({def_tp}/{def_pred_count})")
-    print(f"Recall:     {def_rec:.4f} ({def_tp}/{def_gt_count})")
-    print(f"F1:         {def_f1:.4f}")
-
-    print(f"\n[Defect Tolerance Accuracy (Class 2)] tol={DEF_TOL2:.4f}")
-    # Precision: val (TP/PredCount) - Wait, Prec = TP/(TP+FP), and TP+FP == PredCount (usually)
-    # Yes, unless logic differs. def_pred_count should equal def_tp + def_fp.
-    # Let's verify consistency. _greedy_match returns TP, FP. TP+FP = len(pred).
-    # So yes, PredCount = TP + FP.
-    print(f"Precision:  {def_prec2:.4f} ({def_tp2}/{def_pred_count2})")
-    print(f"Recall:     {def_rec2:.4f} ({def_tp2}/{def_gt_count2})")
-    print(f"F1:         {def_f12:.4f}")
+    return {"mBOF": mbof_t, "DMA": dma_t,
+            "by_mat": acc_by_mat, "by_uc": acc_by_uc}
 
 
 # ==============================================================================
@@ -691,7 +687,7 @@ def visualize_dispersion_comparison(cfg, device,
     
     print(f"[Viz] Loading visualization data from {len(target_paths)} files (Fixed Order)...")
     
-    X_list, M_list, F_list = [], [], []
+    X_list, M_list, F_list, D_list = [], [], [], []
     # 💡 Track which materials were successfully loaded and their sizes
     loaded_materials = []  # (mat_name, n_samples) in load order
     for mat, p in zip(materials, target_paths):
@@ -702,6 +698,8 @@ def visualize_dispersion_comparison(cfg, device,
             z = np.load(p)
             X = z["X"].astype(np.float32)
             M = z["M"].astype(np.int64)
+            # D = TMM Supercell Dispersion Relation (SDR) — exact simulation result
+            D = z["D"].astype(np.float32) if "D" in z.files else np.zeros_like(X[:, :, 0])
             if "F" in z.files:
                 F = z["F"].astype(np.float32)
                 if F.ndim == 1: F = np.tile(F.reshape(1, -1), (X.shape[0], 1))
@@ -709,7 +707,7 @@ def visualize_dispersion_comparison(cfg, device,
                 K = M.shape[1]
                 F = np.tile(np.linspace(0.0, np.pi, K, dtype=np.float32), (X.shape[0], 1))
             print(f"Loaded {os.path.basename(p)}: shape={X.shape}")
-            X_list.append(X); M_list.append(M); F_list.append(F)
+            X_list.append(X); M_list.append(M); F_list.append(F); D_list.append(D)
             loaded_materials.append((mat, X.shape[0]))
         except Exception as e:
             print(f"Error loading {p}: {e}")
@@ -720,6 +718,7 @@ def visualize_dispersion_comparison(cfg, device,
     X_all = np.concatenate(X_list, axis=0)
     M_all = np.concatenate(M_list, axis=0)
     F_all = np.concatenate(F_list, axis=0)
+    D_all = np.concatenate(D_list, axis=0)  # TMM SDR: [N_total, K]
     print(f"[Viz] Total samples loaded: {X_all.shape[0]}")
 
     # Full structures list (matches sorted h5 filenames per material)
@@ -793,7 +792,7 @@ def visualize_dispersion_comparison(cfg, device,
         return model_sdr(X, f, src_key_padding_mask=padding_mask).squeeze(0).detach().cpu().numpy()
 
     # --- Helper for Single Sample Visualization ---
-    def _viz_one_sample(layers_np, freqs_np, M_cond, save_path, fig=None, axes=None):
+    def _viz_one_sample(layers_np, freqs_np, M_cond, sdr_true_tmm, save_path, fig=None, axes=None):
         # 1) Prepare Inputs
         n_cells_i = int(np.clip((layers_np[:, 2] > 0.0).sum(), 1, cfg.max_cells))
         mat_cond_arr = np.array([layers_np[0,0], layers_np[0,1],
@@ -811,8 +810,9 @@ def visualize_dispersion_comparison(cfg, device,
         idx_cells = torch.arange(cfg.max_cells, device=device).unsqueeze(0)
         valid_mask_true = (idx_cells < n_cells_t.unsqueeze(1))
         layers_true = zero_pad_layers(layers_true, valid_mask_true.squeeze(0))
-        S_true = sdr_from_layers(layers_true, f_t, valid_mask_true)
-        
+        # GT SDR already provided as TMM array — no surrogate call needed
+        # (Only Gen SDR is computed via surrogate)
+
         # 3) Generation
         z_sampled = ddpm.sample_ddim(B=1,
                     band_mask=torch.from_numpy(M_cond).to(device).unsqueeze(0),
@@ -830,8 +830,14 @@ def visualize_dispersion_comparison(cfg, device,
         
         S_gen    = sdr_from_layers(layers_gen, f_t, valid_mask_gen)
         band_gen = band_from_layers(layers_gen, f_t, valid_mask_gen)
-        
-        # Apply Don't Care regions from conditioning mask to the generated prediction
+
+        # GT: use TMM-based SDR and band mask from cache (exact simulation, not surrogate)
+        S_true = sdr_true_tmm   # [K] numpy array — already float32 from cache
+
+        # GT band mask: M_cond is the TMM-based conditioning mask from data build
+        band_true = M_cond.copy()
+
+        # Apply Don't-Care regions from conditioning mask to Gen prediction only
         band_gen[M_cond == 3] = 3
 
         # 4) Plotting
@@ -914,9 +920,9 @@ def visualize_dispersion_comparison(cfg, device,
                     color='k', linewidth=1.0)
 
         # Bottom Box (Gen): y=[0.0, 0.9]
-        _draw_mask_box(axL, band_gen, 0.0, 0.9)
-        # Top Box (GT): y=[1.0, 1.9]
-        _draw_mask_box(axL, M_cond, 1.0, 0.9)
+        _draw_mask_box(axL, band_gen,  0.0, 0.9)
+        # Top Box (GT surrogate): y=[1.0, 1.9]
+        _draw_mask_box(axL, band_true, 1.0, 0.9)
         
         axL.set_xlim(edges[0], edges[-1])
         axL.set_ylim(0.0, 1.9) # Tight fit to top
@@ -1031,6 +1037,7 @@ def visualize_dispersion_comparison(cfg, device,
 
                 try:
                     _viz_one_sample(X_all[global_idx], F_all[global_idx], M_all[global_idx],
+                                    D_all[global_idx],   # TMM SDR for GT
                                     save_path, fig=global_fig, axes=global_axes)
                     cnt_saved += 1
                     if cnt_saved % 20 == 0:
@@ -1115,11 +1122,111 @@ def _mask_to_intervals_1d(freqs: np.ndarray,
 
 
 def _interval_iou(a: tuple, b: tuple) -> float:
-    """단일 구간 IoU: |A∩B| / |A∪B|"""
+    """IoU of two 1-D intervals."""
     (a0, a1), (b0, b1) = a, b
     inter = max(0.0, min(a1, b1) - max(a0, b0))
     uni   = max(a1, b1) - min(a0, b0)
     return (inter / uni) if uni > 0 else 0.0
+
+
+@torch.no_grad()
+def _mbof_batch(pred_mask: torch.Tensor,
+                gt_mask:   torch.Tensor,
+                freqs:     torch.Tensor,
+                min_width: float = 0.0) -> dict:
+    """
+    Mean Bandgap Overlap Fidelity (mBOF) — accumulator for one batch.
+
+        mBOF = (1/n_test) * Σ_i  IoU(I_i, Î_i)
+
+    Per-sample IoU = (sum of matched-pair IoUs) / (number of GT bandgaps).
+    Only samples with ≥1 GT bandgap (label=1) are counted.
+    Returns cumulative iou_sum and n_samples for cross-batch accumulation.
+    """
+    pred_np = pred_mask.detach().cpu().numpy().copy()
+    gt_np   = gt_mask.detach().cpu().numpy()
+    freq_np = freqs.detach().cpu().numpy()
+    pred_np[gt_np == 3] = 0  # zero-out predictions in don't-care regions
+
+    iou_sum, n_samples = 0.0, 0
+    for b in range(pred_np.shape[0]):
+        gt_ivs = _mask_to_intervals_1d(freq_np[b], gt_np[b], 1, min_width)
+        if len(gt_ivs) == 0:
+            continue
+        pred_ivs = _mask_to_intervals_1d(freq_np[b], pred_np[b], 1, min_width)
+
+        if len(pred_ivs) == 0:
+            sample_iou = 0.0
+        else:
+            used_p, used_g = set(), set()
+            pairs = sorted(
+                [(_interval_iou(p, g), pi, gi)
+                 for gi, g in enumerate(gt_ivs)
+                 for pi, p in enumerate(pred_ivs)
+                 if _interval_iou(p, g) > 0],
+                reverse=True
+            )
+            matched = []
+            for iou, pi, gi in pairs:
+                if pi in used_p or gi in used_g:
+                    continue
+                used_p.add(pi); used_g.add(gi)
+                matched.append(iou)
+            # Unmatched GT intervals contribute 0; normalise by total GT count
+            sample_iou = sum(matched) / len(gt_ivs)
+
+        iou_sum   += sample_iou
+        n_samples += 1
+    return {"iou_sum": iou_sum, "n_samples": n_samples}
+
+
+@torch.no_grad()
+def _dma_batch(pred_mask: torch.Tensor,
+               gt_mask:   torch.Tensor,
+               freqs:     torch.Tensor,
+               delta:     float = 0.5,
+               min_width: float = 0.0) -> dict:
+    """
+    Defect-band Matching Accuracy DMA(δ) — accumulator for one batch.
+
+        DMA(δ) = (1/n_test) * Σ_i  [ |f_defect,i − f̂_defect,i| ≤ δ ]
+
+    Per-sample score = (number of GT defects matched within δ) / (total GT defects).
+    Only samples with ≥1 GT defect band (label=2) are counted.
+    """
+    pred_np = pred_mask.detach().cpu().numpy().copy()
+    gt_np   = gt_mask.detach().cpu().numpy()
+    freq_np = freqs.detach().cpu().numpy()
+    pred_np[gt_np == 3] = 0
+
+    match_sum, n_samples = 0.0, 0
+    for b in range(pred_np.shape[0]):
+        gt_ivs = _mask_to_intervals_1d(freq_np[b], gt_np[b], 2, min_width)
+        if len(gt_ivs) == 0:
+            continue
+        pred_ivs = _mask_to_intervals_1d(freq_np[b], pred_np[b], 2, min_width)
+
+        g_centers = [(g[0] + g[1]) / 2.0 for g in gt_ivs]
+        p_centers = [(p[0] + p[1]) / 2.0 for p in pred_ivs]
+
+        pairs = sorted(
+            [(abs(gc - pc), pi, gi)
+             for gi, gc in enumerate(g_centers)
+             for pi, pc in enumerate(p_centers)
+             if abs(gc - pc) <= delta],
+            key=lambda x: x[0]
+        )
+        used_p, used_g = set(), set()
+        matched = 0
+        for _, pi, gi in pairs:
+            if pi in used_p or gi in used_g:
+                continue
+            used_p.add(pi); used_g.add(gi)
+            matched += 1
+
+        match_sum += matched / len(gt_ivs)
+        n_samples += 1
+    return {"match_sum": match_sum, "n_samples": n_samples}
 
 
 def _greedy_match_intervals(pred_intervals, gt_intervals, iou_thr=0.5):
