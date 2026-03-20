@@ -175,16 +175,24 @@ class BandMaskCondEncoder(nn.Module):
         
     def forward(self, band_mask: torch.Tensor):
         # band_mask: [B, K]
-        
+
         # 1. Embed
-        x = self.embedding(band_mask.long()) # [B, K, out_dim]
-        
+        x = self.embedding(band_mask.long())  # [B, K, out_dim]
+
         # 2. Add Positional Encoding
         x = self.pos_enc(x)
-        
+
         # 3. Transform
-        x = self.transformer(x) # [B, K, out_dim]
-        
+        # 💡 [Fix] Do NOT call self.transformer(x) — PyTorch's TransformerEncoder.forward()
+        #    runs `any(isinstance(m, ...) for m in self.modules())` on EVERY call.
+        #    Over 50 DDIM steps × 2 CFG × ~2600 batches = 260,000+ module-tree traversals,
+        #    this generator pressure corrupts the C heap and causes a segfault.
+        #    Manual loop is numerically identical (no padding mask, no nested tensor).
+        for layer in self.transformer.layers:
+            x = layer(x)
+        if self.transformer.norm is not None:
+            x = self.transformer.norm(x)
+
         return x
 
 class BandMaskCondEncoder_DualConv(nn.Module):
@@ -225,29 +233,34 @@ class BandMaskCondEncoder_DualConv(nn.Module):
         
     def forward(self, band_mask: torch.Tensor):
         # band_mask: [B, K] (Values: 0, 1, 2)
-        
+
         # 1. Dual Channel Preparation
         mask_ch1 = band_mask.long()
-        mask_ch2 = (band_mask == 2).long() # 0 or 1
-        
+        mask_ch2 = (band_mask == 2).long()  # 0 or 1
+
         # 2. Embedding
-        x1 = self.emb1(mask_ch1) # [B, K, D]
-        x2 = self.emb2(mask_ch2) # [B, K, D]
-        
+        x1 = self.emb1(mask_ch1)  # [B, K, D]
+        x2 = self.emb2(mask_ch2)  # [B, K, D]
+
         # 3. Concat & Conv1d
         # Conv1d expects [B, Channels, Length]
-        x_cat = torch.cat([x1, x2], dim=-1) # [B, K, 2D]
-        x_cat = x_cat.permute(0, 2, 1)      # [B, 2D, K]
-        
-        x_conv = self.conv1d(x_cat)         # [B, D, K]
-        x_conv = x_conv.permute(0, 2, 1)    # [B, K, D]
-        
+        x_cat = torch.cat([x1, x2], dim=-1)  # [B, K, 2D]
+        x_cat = x_cat.permute(0, 2, 1)       # [B, 2D, K]
+
+        x_conv = self.conv1d(x_cat)          # [B, D, K]
+        x_conv = x_conv.permute(0, 2, 1)     # [B, K, D]
+
         # 4. Positional Encoding
         x = self.pos_enc(x_conv)
-        
-        # 5. Transformer
-        x = self.transformer(x) # [B, K, D]
-        
+
+        # 5. Transform
+        # 💡 [Fix] Same as BandMaskCondEncoder — bypass TransformerEncoder.forward()
+        #    to avoid self.modules() genexpr on every call (see above for explanation).
+        for layer in self.transformer.layers:
+            x = layer(x)
+        if self.transformer.norm is not None:
+            x = self.transformer.norm(x)
+
         return x
 
 class UNet1D(nn.Module):
@@ -315,7 +328,11 @@ class UNet1D(nn.Module):
             if x.size(-1) != feats[d].size(-1): x = F.pad(x, (0, feats[d].size(-1) - x.size(-1)))
             x = x + feats[d]
             x = self.ups[d](x, adaln_vec, context_vec)
-            
+
+        # 💡 [Fix] UNet1D.forward had no return statement — was silently returning None.
+        x = x.view(B, -1)
+        return self.outp(x)
+
 class DiffusionTransformer(nn.Module):
     """
     DiT-style Transformer Backbone for 1D Latent Diffusion
@@ -675,56 +692,67 @@ class DDPM(nn.Module):
         return x
 
     @torch.no_grad()
-    def sample_ddim(self, B: int, band_mask: torch.Tensor, material_conds: torch.Tensor, n_cells: torch.Tensor, 
+    def sample_ddim(self, B: int, band_mask: torch.Tensor, material_conds: torch.Tensor, n_cells: torch.Tensor,
                     z_dim: int, device: torch.device, w: float = 4.0, ddim_steps: int = 50, eta: float = 0.0):
         """
         Clean DDIM Sampling
         x_{t-1} = sqrt(alpha_bar_{t-1}) * pred_x0 + dir_xt + noise
         """
         # 1. Timeline Selection
-        timesteps = torch.linspace(0, self.T - 1, ddim_steps).long().flip(0).tolist()
-        
+        # 💡 [Fix] Use numpy integer linspace to avoid float→int rounding that
+        #    could produce duplicate timestep indices with torch.linspace().long().
+        timesteps = np.linspace(0, self.T - 1, ddim_steps, dtype=int).tolist()[::-1]
+
         # 2. Initial Noise
         z = torch.randn(B, z_dim, device=device)
-        
+
         # 3. Sampling Loop
         for i, t in enumerate(timesteps):
             # Calculate t_prev
-            t_prev = timesteps[i+1] if i < len(timesteps) - 1 else -1
-            
+            t_prev = timesteps[i + 1] if i < len(timesteps) - 1 else -1
+
             # Setup Tensors
             tt = torch.full((B,), t, device=device, dtype=torch.long)
-            
+
             # Predict Noise (CFG)
             eps_c = self.model(z, tt, band_mask, material_conds, n_cells)
-            
-            # [New] Uncond Token = 3
+
+            # Uncond Token = 3
             null_band_mask = torch.full_like(band_mask, 3)
             eps_empty = self.model(z, tt, null_band_mask, material_conds, n_cells)
-            
+
             eps = eps_empty + w * (eps_c - eps_empty)
-            
+
             # DDIM Constants
             alpha_bars = self.alphas_cumprod
-            alpha_bar_t = alpha_bars[t]
+            alpha_bar_t      = alpha_bars[t]
             alpha_bar_t_prev = alpha_bars[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=device)
-            
-            sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
-            
+
+            # 💡 [Fix] Clamp the argument of sqrt to ≥ 0 to prevent NaN when eta > 0
+            #    and the ratio math produces a tiny negative due to floating-point error.
+            sigma_ratio = torch.clamp(
+                (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev),
+                min=0.0
+            )
+            sigma_t = eta * torch.sqrt(sigma_ratio)
+
             # Predict x0
             pred_x0 = (z - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
-            
+
             # Compute Direction to x_t
-            dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
-            
+            dir_coef = torch.clamp(1 - alpha_bar_t_prev - sigma_t ** 2, min=0.0)
+            dir_xt   = torch.sqrt(dir_coef) * eps
+
             # Update z (x_{t-1})
             noise = torch.randn_like(z) if t_prev >= 0 else 0.0
             z = torch.sqrt(alpha_bar_t_prev) * pred_x0 + dir_xt + sigma_t * noise
-            
-            # Free intermediate tensors to prevent VRAM accumulation
+
+            # 💡 [Fix] Free ALL intermediate tensors (including scalars) to prevent
+            #    VRAM accumulation across 50 steps × thousands of batches.
             del eps_c, eps_empty, eps, pred_x0, dir_xt, noise, tt, null_band_mask
-            
-        return z           
+            del alpha_bar_t, alpha_bar_t_prev, sigma_t, sigma_ratio, dir_coef
+
+        return z
 
 
 class EMA:

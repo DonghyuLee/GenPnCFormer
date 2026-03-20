@@ -29,7 +29,7 @@ class CFG:
     
     # Model Config
     dropout: float = 0.00
-    batch_size: int = 256 
+    batch_size: int = 128 
     num_workers: int = 0  # fork+CUDA 충돌 방지 (데이터가 RAM에 전적재되므로 속도 손실 없음)
     
     # VAE 

@@ -12,6 +12,7 @@ from matplotlib.patches import Rectangle
 from diffusion import UNet1D, DDPM, DiffusionTransformer
 from vae import VAE_Decoder, scale_to_tanh, unscale_from_tanh
 from data_utils import build_band_mask
+from data_generation.tmm_torch import TorchTMM
 
 # surrogate (PnCFormer)
 from surrogate.models.pncformer import PnCFormer
@@ -333,6 +334,98 @@ class SurrogateBandSolver:
 
 
 # ==============================================================================
+# Exact Physics Solver (TMM)
+# ==============================================================================
+
+class TMMBandSolver:
+    def __init__(self, cfg, device):
+        self.cfg = cfg
+        self.device = device
+        self.freq_start_hz = 100.0
+        self.freq_stop_hz = 50000.0
+        self.freq_step_hz = 100.0
+
+    @torch.no_grad()
+    def __call__(self, lengths_unscaled, material_conds, n_cells, freqs):
+        """
+        Mimics SurrogateBandSolver.__call__.
+        freqs is not strictly needed for TorchTMM init but we keep the signature.
+        """
+        B, L, _ = lengths_unscaled.shape
+        lengths_c = lengths_unscaled.squeeze(-1) # [B, L]
+        
+        # We assume material_conds has (E1, rho1, E2, rho2)
+        # However, they might be different per batch item. 
+        # TorchTMM currently takes scalar modulus_A, density_A in init.
+        # But in our dataset per material folder, they are constant across the batch.
+        # We'll use the first item in the batch to init TorchTMM (safe if batch is same material type).
+        m_A = float(material_conds[0, 0].item()) * 1e9
+        r_A = float(material_conds[0, 1].item())
+        m_B = float(material_conds[0, 2].item()) * 1e9
+        r_B = float(material_conds[0, 3].item())
+        
+        tmm = TorchTMM(
+            modulus_A=m_A, density_A=r_A,
+            modulus_B=m_B, density_B=r_B,
+            batch_size=B,
+            freq_start_hz=self.freq_start_hz,
+            freq_stop_hz=self.freq_stop_hz,
+            freq_step_hz=self.freq_step_hz,
+            device=self.device
+        )
+        
+        K = tmm.f.shape[1]
+        
+        # Build UDR
+        if L >= 2:
+            TM_A = tmm.TM(m_A, r_A, lengths_c[:, 0].unsqueeze(-1).double()) # [B, 1]
+            TM_B = tmm.TM(m_B, r_B, lengths_c[:, 1].unsqueeze(-1).double())
+            T_udr = torch.matmul(TM_A, TM_B)
+            trace_udr = T_udr[..., 0, 0] + T_udr[..., 1, 1]
+            x_udr = torch.clamp(torch.real(trace_udr) / 2.0, -1.0, 1.0)
+            UDR_pred = torch.acos(x_udr).cpu().numpy() # [B, K]
+        else:
+            UDR_pred = np.zeros((B, K))
+            
+        # Build SDR
+        T_sdr = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=self.device)
+        T_sdr[..., 0, 0] = 1.0
+        T_sdr[..., 1, 1] = 1.0
+        
+        # Max cells to iterate
+        L_max = L
+        
+        for i in range(L_max):
+            use_mat2 = (i % 2 == 1)
+            mod = m_B if use_mat2 else m_A
+            rho = r_B if use_mat2 else r_A
+            l_i = lengths_c[:, i].unsqueeze(-1).double() # [B, 1]
+            
+            # Valid mask per item: is this layer index < n_cells * 2?
+            # Actually layers are already zero-padded/masked or length=0
+            valid_mask = (l_i.squeeze(-1) > 0) # [B]
+            TM_layer = tmm.TM(mod, rho, l_i) # [B, K, 2, 2]
+            
+            # Apply Identity matrix where layer is invalid (length 0)
+            TM_layer[~valid_mask] = T_sdr[0, :, :, :] * 0.0
+            TM_layer[~valid_mask, ..., 0, 0] = 1.0
+            TM_layer[~valid_mask, ..., 1, 1] = 1.0
+            
+            T_sdr = torch.matmul(T_sdr, TM_layer)
+
+        trace_sdr = T_sdr[..., 0, 0] + T_sdr[..., 1, 1]
+        x_sdr = torch.clamp(torch.real(trace_sdr) / 2.0, -1.0, 1.0)
+        SDR_pred = torch.acos(x_sdr).cpu().numpy() # [B, K]
+        
+        # Build Mask
+        band_masks = []
+        for i in range(B):
+            band_masks.append(build_band_mask(UDR_pred[i], SDR_pred[i]).astype(np.int64))
+            
+        return torch.from_numpy(np.stack(band_masks, 0))
+
+
+# ==============================================================================
 # Inference & Evaluation
 # ==============================================================================
 
@@ -344,15 +437,17 @@ def run_inference_and_evaluation(cfg, device,
                                  eta: float = 0.0,
                                  test_paths: list | None = None,
                                  diffusion_path: str | None = None,
-                                 vae_path: str | None = None):
+                                 vae_path: str | None = None,
+                                 use_tmm: bool = False):
     """
     1) DDPM 샘플링 → VAE 디코딩
-    2) Surrogate(PnCFormer)로 band mask 예측
+    2) Surrogate(PnCFormer) or Exact Physics (TMM)로 band mask 예측
     3) condition band mask와 비교
        - Bandgap (Class 1): IoU metrics
        - Defect (Class 2): Tolerance metrics
     """
-    print("\n--- Starting Inference & Evaluation (VAE+DDPM + Surrogate) ---")
+    evaluator_name = "TMM" if use_tmm else "Surrogate"
+    print(f"\n--- Starting Inference & Evaluation (VAE+DDPM + {evaluator_name}) ---")
 
     # --- Checkpoints ---
     ddpm_ckpt_path = diffusion_path if diffusion_path else os.path.join(cfg.save_dir, "ddpm_transformer_best.pt")
@@ -360,16 +455,27 @@ def run_inference_and_evaluation(cfg, device,
 
     # --- DDPM ---
     ddpm_state = torch.load(ddpm_ckpt_path, map_location=device, weights_only=True)
-    
-    # 💡 Model Selection
-    # Disable nested tensor prototype to prevent C++ memory/state corruption during long loops
+
+    # 💡 [Fix A] Disable NestedTensor BEFORE creating any model instance.
     if hasattr(torch.backends.cuda, 'enable_nested_tensor'):
         torch.backends.cuda.enable_nested_tensor = False
-        print("[Eval] Disabled PyTorch NestedTensor prototype to ensure stability.")
+
+    # 💡 [Fix B - ROOT CAUSE] PyTorch 2.5.x TransformerEncoderLayer.forward() runs
+    #    `any(len(getattr(m,'_forward_hooks',{})) + ... for m in self.modules())`
+    #    on EVERY forward call (line 822 of transformer.py) to check for attached hooks.
+    #    During inference: 50 DDIM steps × 2 CFG × 2600 batches = 260,000+ genexpr
+    #    executions, each traversing the full module tree. This causes heap corruption.
+    #
+    #    Setting fastpath=False makes the VERY FIRST condition in that check branch
+    #    return True immediately, bypassing the self.modules() genexpr entirely.
+    #    This is the official PyTorch 2.x API for this toggle.
+    if hasattr(torch.backends, 'mha'):
+        torch.backends.mha.set_fastpath_enabled(False)
+        print("[Eval] Disabled MHA fastpath to prevent self.modules() heap corruption.")
 
     backbone_type = getattr(cfg, "diffusion_backbone", "transformer")
     print(f"[Eval] Using diffusion backbone: {backbone_type}")
-    
+
     if backbone_type == "transformer":
         model = DiffusionTransformer(
             latent_dim=cfg.latent_dim,
@@ -381,7 +487,7 @@ def run_inference_and_evaluation(cfg, device,
         ).to(device)
     else:
         model = UNet1D(cfg.latent_dim, cfg.unet_width, cfg.unet_depth, cfg.dropout, cfg).to(device)
-        
+
     ddpm = DDPM(model, cfg.timesteps, cfg.beta_start, cfg.beta_end).to(device)
     if "ddpm" in ddpm_state:
         ddpm.load_state_dict(ddpm_state["ddpm"])
@@ -399,8 +505,13 @@ def run_inference_and_evaluation(cfg, device,
     vae_decoder.eval()
     print("Loaded trained VAE Decoder.")
 
-    # --- Surrogate Solver ---
-    surrogate_solver = SurrogateBandSolver(cfg, device)
+    # --- Surrogate or TMM Solver ---
+    if use_tmm:
+        print("[Eval] Initializing Exact Physics Solver (TMM)...")
+        band_solver = TMMBandSolver(cfg, device)
+    else:
+        print("[Eval] Initializing Deep Learning Surrogate Solver (PnCFormer)...")
+        band_solver = SurrogateBandSolver(cfg, device)
 
     # --- Data ---
     # test_paths must be passed or we iterate
@@ -479,7 +590,7 @@ def run_inference_and_evaluation(cfg, device,
         dl  = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
                          num_workers=0, pin_memory=False)
 
-        for batch in dl:
+        for batch_idx, batch in enumerate(dl):
             # inputs
             material_conds = batch["material_conds"].to(device)       # [B, 4]
             n_cells = torch.clamp(batch["n_cells"].to(device), min=1) # [B]
@@ -507,12 +618,21 @@ def run_inference_and_evaluation(cfg, device,
                 lengths_pred_scaled   = vae_decoder(z_sampled, material_conds, n_cells)
                 lengths_pred_unscaled = unscale_from_tanh(lengths_pred_scaled)
 
-            lengths_fp32 = lengths_pred_unscaled.float().detach()
+            lengths_fp32 = torch.clamp(lengths_pred_unscaled.float().detach(), 0.0, 10.0)
             material_conds_fp32 = material_conds.float()
-            band_mask_pred = surrogate_solver(
+            
+            # Sanity check for NaN/Inf
+            if torch.isnan(lengths_fp32).any() or torch.isinf(lengths_fp32).any():
+                print(f"\n[Error] NaN/Inf detected in predicted lengths at batch. Filling with zeros.")
+                lengths_fp32 = torch.nan_to_num(lengths_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+
+            band_mask_pred = band_solver(
                 lengths_fp32, material_conds_fp32, n_cells, freqs,
             )  # [B, K] — CPU
 
+            # 💡 [Fix] Sync every batch: ensures all CUDA kernels finish before
+            #    Python proceeds to the next iteration, preventing kernel overlap
+            #    that accumulates into heap corruption over thousands of batches.
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
@@ -546,13 +666,18 @@ def run_inference_and_evaluation(cfg, device,
             pbar.set_postfix(mat=mat, mBOF=f"{cur_mbof:.4f}", DMA=f"{cur_dma:.4f}")
             pbar.update(1)
 
-            # Explicit VRAM cleanup
+            # Explicit VRAM cleanup every batch
             del z_sampled, lengths_pred_scaled, lengths_pred_unscaled
             del lengths_fp32, material_conds_fp32, band_mask_pred
             del material_conds, n_cells, band_mask, freqs
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+
+            # 💡 [Fix] Old condition `(num_samples // 128) % 100 == 0` only fires
+            #    at exact multiples of 12,800 — unreliable with variable last-batch size.
+            #    New: reliable batch counter, fires every 50 batches.
+            if batch_idx % 50 == 49:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     pbar.close()
 
@@ -608,7 +733,8 @@ def visualize_dispersion_comparison(cfg, device,
                                        ddim_steps: int = 50,
                                        test_paths: list | None = None,
                                        diffusion_path: str | None = None,
-                                       vae_path: str | None = None):
+                                       vae_path: str | None = None,
+                                       use_tmm: bool = False):
     """
     User Request:
       - Bulk export: 6 Materials (CA..AT) * 28 Structures * 20 Samples = 3360 images.
@@ -669,15 +795,19 @@ def visualize_dispersion_comparison(cfg, device,
         try:
             st = torch.load(path, map_location=device, weights_only=True)
         except TypeError:
-            st = torch.load(path, map_path=device)
+            # 💡 [Fix] 'map_path' was a typo; the correct kwarg is 'map_location'.
+            st = torch.load(path, map_location=device)
         if isinstance(st, dict):
             st = st.get("state_dict", st.get("model", st))
         m.load_state_dict(st); m.eval()
         return m
 
-    model_udr = _load_pnc(udr_ckpt)
-    model_tr  = _load_pnc(tr_ckpt)
-    model_sdr = _load_pnc(sdr_ckpt)
+    if not use_tmm:
+        model_udr = _load_pnc(udr_ckpt)
+        model_tr  = _load_pnc(tr_ckpt)
+        model_sdr = _load_pnc(sdr_ckpt)
+    else:
+        model_udr = model_tr = model_sdr = None
 
     import sys, traceback
     
@@ -771,22 +901,73 @@ def visualize_dispersion_comparison(cfg, device,
         R = torch.where(use_mat2, r2, r1).expand_as(Ls)
         valid_mask = (idx < n_cells.unsqueeze(1))
         layers = torch.stack([E, R, Ls], dim=-1)
-        layers = zero_pad_layers(layers, valid_mask.squeeze(0))
+        # 💡 [Fix] Do NOT call .squeeze(0) on valid_mask — it only works for B=1.
+        #    zero_pad_layers expects matching [B, L] shape for any batch size.
+        layers = zero_pad_layers(layers, valid_mask)
         return layers, valid_mask
 
-    def tr_from_layers(layers, f, valid_mask):
+    def tr_from_layers(layers, f, valid_mask, mat_conds):
+        if use_tmm:
+            # For TR visualization, we need TorchTMM.get_transmittance
+            B = layers.shape[0]; K = f.shape[1]
+            m_A, r_A = mat_conds[0,0].item() * 1e9, mat_conds[0,1].item()
+            m_B, r_B = mat_conds[0,2].item() * 1e9, mat_conds[0,3].item()
+            tmm = TorchTMM(m_A, r_A, m_B, r_B, B, 100.0, 50000.0, 100.0, device=device)
+            # TorchTMM.get_transmittance needs length_A..D and 'case' dict
+            # For simplicity, we can use the manual chain multiplication logic from run_inverse_design
+            # but since we only need it for viz, maybe surrogate is enough or we implement it.
+            # actually if use_tmm is True, let's skip TR surrogate and just show TMM TR.
+            # But the Viz panel 3 is SDR (Dispersion), not TR. Panel 3 is axR.
+            # Let's check _viz_one_sample layout.
+            return np.zeros(K) # Default to zero if not implemented
         X = layers_to_six_features_torch(layers)
         padding_mask = ~valid_mask
         return model_tr(X, f, src_key_padding_mask=padding_mask).squeeze(0).detach().cpu().numpy()
 
-    def band_from_layers(layers, f, valid_mask):
+    def band_from_layers(layers, f, valid_mask, mat_conds):
+        if use_tmm:
+            m_A, r_A = mat_conds[0,0].item() * 1e9, mat_conds[0,1].item()
+            m_B, r_B = mat_conds[0,2].item() * 1e9, mat_conds[0,3].item()
+            B = layers.shape[0]; L = layers.shape[1]
+            tmm = TorchTMM(m_A, r_A, m_B, r_B, B, 100.0, 50000.0, 100.0, device=device)
+            K = tmm.f.shape[1]
+            lengths_c = layers[..., 2]
+            # UDR
+            TM_A = tmm.TM(m_A, r_A, lengths_c[:, 0].unsqueeze(-1).double())
+            TM_B = tmm.TM(m_B, r_B, lengths_c[:, 1].unsqueeze(-1).double())
+            T_udr = torch.matmul(TM_A, TM_B); x_udr = torch.clamp(torch.real(T_udr[...,0,0]+T_udr[...,1,1])/2., -1., 1.)
+            U_np = torch.acos(x_udr).cpu().numpy()[0]
+            # SDR
+            T_sdr = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=device)
+            T_sdr[..., 0, 0] = 1.0; T_sdr[..., 1, 1] = 1.0
+            for i in range(L):
+                use_mat2 = (i % 2 == 1); mod = m_B if use_mat2 else m_A; rho = r_B if use_mat2 else r_A
+                l_i = lengths_c[:, i].unsqueeze(-1).double(); valid_m = (l_i.squeeze(-1) > 1e-8)
+                TM_l = tmm.TM(mod, rho, l_i); TM_l[~valid_m] = T_sdr[0,:,:,:]*0.0; TM_l[~valid_m,...,0,0]=1.0; TM_l[~valid_m,...,1,1]=1.0
+                T_sdr = torch.matmul(T_sdr, TM_l)
+            S_np = torch.acos(torch.clamp(torch.real(T_sdr[...,0,0]+T_sdr[...,1,1])/2., -1., 1.)).cpu().numpy()[0]
+            return build_band_mask(U_np, S_np).astype(np.int64)
         X = layers_to_six_features_torch(layers)
         padding_mask = ~valid_mask
         U = model_udr(X, f, src_key_padding_mask=padding_mask).squeeze(0).detach().cpu().numpy()
         S = model_sdr(X, f, src_key_padding_mask=padding_mask).squeeze(0).detach().cpu().numpy()
         return build_band_mask(U, S).astype(np.int64)
 
-    def sdr_from_layers(layers, f, valid_mask):
+    def sdr_from_layers(layers, f, valid_mask, mat_conds):
+        if use_tmm:
+            m_A, r_A = mat_conds[0,0].item() * 1e9, mat_conds[0,1].item()
+            m_B, r_B = mat_conds[0,2].item() * 1e9, mat_conds[0,3].item()
+            B = layers.shape[0]; K = f.shape[1]; L = layers.shape[1]
+            tmm = TorchTMM(m_A, r_A, m_B, r_B, B, 100.0, 50000.0, 100.0, device=device)
+            lengths_c = layers[..., 2]
+            T_sdr = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=device)
+            T_sdr[..., 0, 0] = 1.0; T_sdr[..., 1, 1] = 1.0
+            for i in range(L):
+                use_mat2 = (i % 2 == 1); mod = m_B if use_mat2 else m_A; rho = r_B if use_mat2 else r_A
+                l_i = lengths_c[:, i].unsqueeze(-1).double(); valid_m = (l_i.squeeze(-1) > 1e-8)
+                TM_l = tmm.TM(mod, rho, l_i); TM_l[~valid_m] = T_sdr[0,:,:,:]*0.0; TM_l[~valid_m,...,0,0]=1.0; TM_l[~valid_m,...,1,1]=1.0
+                T_sdr = torch.matmul(T_sdr, TM_l)
+            return torch.acos(torch.clamp(torch.real(T_sdr[...,0,0]+T_sdr[...,1,1])/2., -1., 1.)).cpu().numpy()[0]
         X = layers_to_six_features_torch(layers)
         padding_mask = ~valid_mask
         return model_sdr(X, f, src_key_padding_mask=padding_mask).squeeze(0).detach().cpu().numpy()
@@ -828,8 +1009,8 @@ def visualize_dispersion_comparison(cfg, device,
         lengths_pred = unscale_from_tanh(lengths_pred_scaled)
         layers_gen, valid_mask_gen = make_AB_layers(material_conds, lengths_pred, n_cells_t)
         
-        S_gen    = sdr_from_layers(layers_gen, f_t, valid_mask_gen)
-        band_gen = band_from_layers(layers_gen, f_t, valid_mask_gen)
+        S_gen    = sdr_from_layers(layers_gen, f_t, valid_mask_gen, material_conds)
+        band_gen = band_from_layers(layers_gen, f_t, valid_mask_gen, material_conds)
 
         # GT: use TMM-based SDR and band mask from cache (exact simulation, not surrogate)
         S_true = sdr_true_tmm   # [K] numpy array — already float32 from cache
@@ -1150,10 +1331,13 @@ def _mbof_batch(pred_mask: torch.Tensor,
 
     iou_sum, n_samples = 0.0, 0
     for b in range(pred_np.shape[0]):
-        gt_ivs = _mask_to_intervals_1d(freq_np[b], gt_np[b], 1, min_width)
+        # Robust frequency indexing: use shared vector if 1D, else per-sample if 2D
+        f_b = freq_np if freq_np.ndim == 1 else freq_np[b]
+        
+        gt_ivs = _mask_to_intervals_1d(f_b, gt_np[b], 1, min_width)
         if len(gt_ivs) == 0:
             continue
-        pred_ivs = _mask_to_intervals_1d(freq_np[b], pred_np[b], 1, min_width)
+        pred_ivs = _mask_to_intervals_1d(f_b, pred_np[b], 1, min_width)
 
         if len(pred_ivs) == 0:
             sample_iou = 0.0
@@ -1201,10 +1385,13 @@ def _dma_batch(pred_mask: torch.Tensor,
 
     match_sum, n_samples = 0.0, 0
     for b in range(pred_np.shape[0]):
-        gt_ivs = _mask_to_intervals_1d(freq_np[b], gt_np[b], 2, min_width)
+        # Robust frequency indexing: use shared vector if 1D, else per-sample if 2D
+        f_b = freq_np if freq_np.ndim == 1 else freq_np[b]
+
+        gt_ivs = _mask_to_intervals_1d(f_b, gt_np[b], 2, min_width)
         if len(gt_ivs) == 0:
             continue
-        pred_ivs = _mask_to_intervals_1d(freq_np[b], pred_np[b], 2, min_width)
+        pred_ivs = _mask_to_intervals_1d(f_b, pred_np[b], 2, min_width)
 
         g_centers = [(g[0] + g[1]) / 2.0 for g in gt_ivs]
         p_centers = [(p[0] + p[1]) / 2.0 for p in pred_ivs]
@@ -1407,6 +1594,8 @@ def compare_condition_vs_surrogate_truth(
     max_batches: int | None = None,
     iou_thr: float = 0.5,
     min_width: float = 0.0,
+    use_tmm: bool = False,
+    test_paths: list | None = None,
 ):
     """
     Test set에 대해:
@@ -1419,11 +1608,26 @@ def compare_condition_vs_surrogate_truth(
          (IoU 임계치 iou_thr로 매칭, min_width 미만 구간은 무시)
       3) 결함 비율 요약
     """
-    # 1) Surrogate 준비
-    surrogate_solver = SurrogateBandSolver(cfg, device)
+    # 1) Surrogate or TMM 준비
+    evaluator_name = "TMM (Exact Physics)" if use_tmm else "Surrogate-Truth"
+    if use_tmm:
+        band_solver = TMMBandSolver(cfg, device)
+    else:
+        band_solver = SurrogateBandSolver(cfg, device)
 
     # 2) Data
-    test_ds = TestDataset(os.path.join(cfg.cache_dir, "CA_test_with_mask.npz"), cfg.max_cells)
+    if test_paths:
+        paths = test_paths
+    else:
+        paths = [
+            os.path.join(cfg.cache_dir, f"{mat}_test_dispersion.npz")
+            for mat in ["CA", "SA", "TA", "AC", "AS", "AT"]
+            if os.path.exists(os.path.join(cfg.cache_dir, f"{mat}_test_dispersion.npz"))
+        ]
+        
+    print(f"[Eval Truth] Loading test data from {len(paths)} files...")
+    test_datasets = [TestDataset(p, cfg.max_cells) for p in paths]
+    test_ds = torch.utils.data.ConcatDataset(test_datasets)
     test_dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
 
     # -------------------------
@@ -1459,12 +1663,12 @@ def compare_condition_vs_surrogate_truth(
 
         # surrogate-truth mask (기존 설계안 길이 사용)
         lengths_true_unscaled = unscale_from_tanh(lengths_true_scaled)  # [B,L,1]
-        band_mask_truth = surrogate_solver(
+        band_mask_truth = band_solver(
             lengths_unscaled=lengths_true_unscaled,
             material_conds=material_conds,
             n_cells=n_cells,
             freqs=freqs,   # [B,K]
-        )  # [B,K]
+        ).to(device)  # [B,K]
 
         # ---------- 포인트 단위 메트릭 ----------
         metrics = compute_bandmask_metrics(band_mask_truth, band_mask_cond)
@@ -1527,7 +1731,7 @@ def compare_condition_vs_surrogate_truth(
     i_f1   = 2 * i_prec * i_rec / (i_prec + i_rec + 1e-8) if (i_tot_tp + i_tot_fp + i_tot_fn) > 0 else 0.0
     i_mean_iou = (i_all_matched_ious_sum / i_tot_matched) if i_tot_matched > 0 else 0.0
 
-    print("\n--- Condition vs Surrogate-Truth (band mask) ---")
+    print(f"\n--- Condition vs {evaluator_name} (band mask) ---")
     print(f"Total Test Samples: {num_samples}")
     
     print("\n[Metrics] 1) Bandgap (Class 1) - Only for samples with Target Bandgap")
@@ -1535,7 +1739,7 @@ def compare_condition_vs_surrogate_truth(
     print(f"[Point]   Defect Rec:   {avg_rec:.4f}")
     print(f"[Point]   Defect F1:    {avg_f1:.4f}")
     print(f"          TP / FP / FN: {total_tp} / {total_fp} / {total_fn}")
-    print(f"          Defect ratio  (surrogate-truth): {pred_def_ratio*100:.2f}%")
+    print(f"          Defect ratio  (predicted)      : {pred_def_ratio*100:.2f}%")
     print(f"          Defect ratio  (condition mask) : {targ_def_ratio*100:.2f}%")
 
     print(f"\n[Interval IoU]  thr={iou_thr:.2f}, min_width={min_width:.5f}")

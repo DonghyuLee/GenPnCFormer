@@ -1,20 +1,36 @@
 import os
+# 💡 [Fix] Expandable CUDA memory segments (PyTorch 2.1+): prevents heap fragmentation
+#    during long inference loops (2600+ batches × 50 DDIM steps each).
+#    MUST be set before `import torch` to take effect.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+
 import numpy as np
+import faulthandler
+faulthandler.enable()
+
+# Completely disable tqdm monitor
+import tqdm
+try:
+    tqdm.monitor_interval = 0
+except:
+    pass
 from config import CFG, device
 from data_utils import load_or_build_cache_multimat
 from vae import train_vae, build_vae_latent_cache, ConditionalVAE
 from diffusion import train_latent_diffusion, DiffusionTransformer, UNet1D, DDPM
-from eval import run_inference_and_evaluation, visualize_dispersion_comparison, compare_condition_vs_surrogate_truth
+from eval import run_inference_and_evaluation, visualize_dispersion_comparison
 from benchmark import measure_efficiency
 import matplotlib.pyplot as plt
+import argparse
 
 
 if __name__ == "__main__":
-    # i9-13900KF: P-core 8개 × 2 HT = 16 논리 코어로 제한
-    # E-core(core 16~31)에서 libtorch_cpu.so 실행 시 segfault 방지
-    torch.set_num_threads(16)
-    torch.set_num_interop_threads(4)
+    parser = argparse.ArgumentParser(description="GenPnCFormer Main Script")
+    setup_group = parser.add_argument_group("Setup")
+    parser.add_argument("--use_tmm", action="store_true", help="Use exact physics TMM solver instead of PnCFormer surrogate for evaluation")
+    parser.add_argument("--test_only", action="store_true", help="Skip training and only run evaluation")
+    args = parser.parse_args()
 
     cfg = CFG()
     os.makedirs(cfg.save_dir, exist_ok=True)
@@ -44,6 +60,9 @@ if __name__ == "__main__":
     else:
         skip_vae_train = False
 
+    if args.test_only:
+        skip_vae_train = True
+
     if not skip_vae_train:
         print("[VAE] No valid checkpoint found. Start training...")
         vae_ckpt_path = train_vae(cfg, device, train_paths=train_paths, valid_paths=valid_paths)
@@ -69,7 +88,7 @@ if __name__ == "__main__":
     for split_name, path_list in [("train", train_paths), ("valid", valid_paths), ("test", test_paths)]:
         total_samples = 0
         for p in path_list:
-            final_p = p.replace("_with_mask.npz", "_vae_latent.npz")
+            final_p = p.replace("_dispersion.npz", "_vae_latent.npz")
             try:
                 if os.path.exists(final_p):
                     # Just peek at Z size
@@ -82,8 +101,8 @@ if __name__ == "__main__":
         print(f"[{split_name.upper()}] Samples: {total_samples}")
     print("-----------------------\n")
 
+
     # 4) DDPM 학습 및 평가 파이프라인 (Multi-Mode 지원)
-    # modes = ["adaln", "adaln-zero", "mhca"]
     modes = ['adaln-zero']
     base_save_dir = cfg.save_dir
 
@@ -147,6 +166,9 @@ if __name__ == "__main__":
                 os.rename(ddpm_ckpt_path, ddpm_ckpt_path + ".bak")
                 resume_ckpt_path = None
 
+        if args.test_only:
+            skip_ddpm_train = True
+
         if skip_ddpm_train:
             print(f"[DDPM {mode.upper()}] Skipping training...")
         else:
@@ -168,54 +190,19 @@ if __name__ == "__main__":
             )
             print(f"[DDPM {mode.upper()}] Training finished. checkpoint: {ddpm_ckpt_path}")
 
-        # 5) 평가
-        # run_inference_and_evaluation(
-        #     cfg, device, min_width=0.0, w_cfg=5.0, ddim_steps=50, eta=0.0,
-        #     test_paths=test_paths, diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path
-        # )
-
-        # 6) 결과 시각화 
-        vis_dir = f"vis_results_{mode}"
-        visualize_dispersion_comparison(
-            cfg, device, save_dir=vis_dir, w_cfg=5.0,
-            diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path
+        # 5) 평가 
+        run_inference_and_evaluation(
+            cfg, device, min_width=0.0, w_cfg=5.0, ddim_steps=50, eta=0.0,
+            test_paths=test_paths, diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path,
+            use_tmm=args.use_tmm
         )
 
-    # 7) 전체 모드 Benchmarking (효율성 통합 비교)
-
-    # print("\n--- Starting Benchmark (Efficiency) ---")
-    # results = []
-    # for m in modes:
-    #     res = measure_efficiency(cfg, m, device)
-    #     if res: results.append(res)
+        # 6) 결과 시각화 
+        # vis_dir = f"vis_results_{mode}"
+        # if args.use_tmm: vis_dir += "_tmm"
         
-    # if results:
-    #     modes_labels = [r["mode"].upper() for r in results]
-    #     params = [r["params"]/1e6 for r in results]
-    #     flops = [r["flops"]/1e9 for r in results]
-    #     latency = [r["latency"]*1000 for r in results]
-    #     memory = [r["memory"] for r in results]
-        
-    #     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    #     axes[0,0].bar(modes_labels, params, color=['tab:blue', 'tab:orange', 'tab:green'])
-    #     axes[0,0].set_title("Parameters (M)")
-    #     axes[0,0].bar_label(axes[0,0].containers[0], fmt='%.2f')
-        
-    #     if any(f > 0 for f in flops):
-    #         axes[0,1].bar(modes_labels, flops, color=['tab:blue', 'tab:orange', 'tab:green'])
-    #         axes[0,1].set_title("FLOPs (G) per Step")
-    #         axes[0,1].bar_label(axes[0,1].containers[0], fmt='%.2f')
-    #     else:
-    #         axes[0,1].text(0.5, 0.5, "FLOPs N/A", ha='center', va='center')
-        
-    #     axes[1,0].bar(modes_labels, latency, color=['tab:blue', 'tab:orange', 'tab:green'])
-    #     axes[1,0].set_title("Inference Latency (ms)")
-    #     axes[1,0].bar_label(axes[1,0].containers[0], fmt='%.1f')
-        
-    #     axes[1,1].bar(modes_labels, memory, color=['tab:blue', 'tab:orange', 'tab:green'])
-    #     axes[1,1].set_title("Peak Memory (MB)")
-    #     axes[1,1].bar_label(axes[1,1].containers[0], fmt='%.1f')
-        
-    #     plt.tight_layout()
-    #     plt.savefig("benchmark_results.png")
-    #     print(f"Benchmark efficiency plot saved to benchmark_results.png")
+        # visualize_dispersion_comparison(
+        #     cfg, device, save_dir=vis_dir, w_cfg=5.0,
+        #     diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path,
+        #     use_tmm=args.use_tmm
+        # )

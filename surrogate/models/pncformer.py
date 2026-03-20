@@ -82,15 +82,19 @@ class PnCFormer(nn.Module):
         x_emb = self.x_embed(x)
         x_emb = self.x_pos_enc(x_emb)
 
-        # 💡 Fix: Pass bool mask directly to both Encoder and Decoder.
-        # Previously, a float -inf mask was passed to TransformerDecoder's
-        # memory_key_padding_mask. When ALL tokens in a row are masked (-inf),
-        # softmax produces NaN, which corrupts the C++ kernel state and causes
-        # a segfault after hundreds of batches. PyTorch's bool mask path handles
-        # this case safely by clamping attention weights internally.
+        # 💡 Fix 1: Ensure bool dtype — some callers pass float or uint8.
+        # 💡 Fix 2 (Segfault Root Cause): Protect against ALL-masked rows.
+        #    If every token in a batch row is marked as padding, softmax(-inf)
+        #    produces NaN which corrupts the C++ attention kernel state and
+        #    causes a segfault after hundreds of batches.
+        #    We force at least one valid (False=keep) token per row.
         if src_key_padding_mask is not None:
-            # Ensure bool dtype — some callers pass float or uint8
-            bool_pad = src_key_padding_mask.bool()
+            bool_pad = src_key_padding_mask.bool().clone()
+            # Detect rows where ALL positions are masked (True = ignored)
+            all_masked = bool_pad.all(dim=-1)  # [B]
+            if all_masked.any():
+                # Un-mask the first token for those rows so softmax stays valid
+                bool_pad[all_masked, 0] = False
         else:
             bool_pad = None
 
@@ -101,8 +105,7 @@ class PnCFormer(nn.Module):
         f_emb = self.f_embed(f)
         f_emb = self.f_pos_enc(f_emb)
 
-        # 💡 Fix: Use the same bool mask for decoder cross-attention.
-        # DO NOT use float -inf mask here — it causes NaN → segfault.
+        # 💡 Use the same cleaned bool mask for decoder cross-attention.
         dec = self.decoder(tgt=f_emb, memory=memory, memory_key_padding_mask=bool_pad)
-        out = self.fc_out(dec).squeeze(-1) # (B, F)
+        out = self.fc_out(dec).squeeze(-1)  # (B, F)
         return out

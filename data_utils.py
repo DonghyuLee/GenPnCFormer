@@ -29,12 +29,14 @@ def pad_or_truncate_X(X, max_cells):
 
 def _runs_bool(b):
     """bool 1D 배열 True 연속구간을 (start,end) (end포함) 리스트로"""
-    F = b.shape[0]
+    if not hasattr(b, 'shape'):
+        return []
+    _length = b.shape[0]
     runs, i = [], 0
-    while i < F:
+    while i < _length:
         if b[i]:
             s = i
-            while i+1 < F and b[i+1]:
+            while i+1 < _length and b[i+1]:
                 i += 1
             runs.append((s, i))
         i += 1
@@ -74,9 +76,8 @@ def build_band_mask(
     Returns:
         np.ndarray: 밴드 마스크 배열 (0: 전달 밴드, 1: 밴드갭, 2: 디펙트 밴드). (F,) 형태.
     """
-    u = np.nan_to_num(udr, nan=0.0)
-    
-    F = u.shape[0]
+    u = np.nan_to_num(udr, nan=0.0, posinf=0.0, neginf=0.0)
+    _length = u.shape[0]
 
     # 1) UC gap mask 정의 (UDR 사용)
     # 1a. 0과 pi 근처 영역을 각각 정의
@@ -86,14 +87,14 @@ def build_band_mask(
     # 1b. 저주파 예외 처리 (0에서 시작하는 Acoustic branch)
     is_not_near_zero = ~is_near_zero
     first_pass_end = 0
-    if F > 0 and is_near_zero[0]:
+    if _length > 0 and is_near_zero[0]:
         if is_not_near_zero.any():
             first_pass_end = np.where(is_not_near_zero)[0][0]
         else:
-            first_pass_end = F
+            first_pass_end = _length
 
     # 1c. 최종 밴드갭 마스크
-    uc_gap = is_near_zero | is_near_pi
+    uc_gap = (is_near_zero | is_near_pi).copy()
     uc_gap[0 : first_pass_end] = False
 
     # 2) 기본 마스크 설정: gap=1, pass=0
@@ -106,9 +107,7 @@ def build_band_mask(
     mask[uc_gap] = 1
 
     # 3) Defect Detection using Supercell Dispersion (SDR)
-    # Logic: Gap 구간 내부에서 SDR이 0에서 pi로 가로지르는 밴드를 모두 찾음 (Double Defect 등 겹침 허용).
-    
-    s = np.nan_to_num(sdr, nan=0.0)
+    s = np.nan_to_num(sdr, nan=0.0, posinf=0.0, neginf=0.0)
     gap_runs = _runs_bool(uc_gap)
     
     for (g_start, g_end) in gap_runs:
@@ -117,9 +116,10 @@ def build_band_mask(
         
         # 앞뒤로 여유(2포인트)를 두어 끝점 터치 확인 보완
         check_s = max(0, g_start - 2)
-        check_e = min(F - 1, g_end + 2)
+        check_e = min(_length - 1, g_end + 2)
         
-        band_vals = s[check_s : check_e + 1]
+        band_vals = s[check_s : check_e + 1].copy()
+        if band_vals.size == 0: continue
         
         # Double Defect같이 밴드가 여러 번 꺾이는 부분(Extrema) 찾기
         peaks, _ = find_peaks(band_vals, prominence=1.0)
@@ -132,30 +132,29 @@ def build_band_mask(
             seg_e = turn_pts[i+1]
             if seg_e - seg_s < 1: continue
             
-            check_vals = band_vals[seg_s : seg_e + 1]
-            b_range = np.max(check_vals) - np.min(check_vals)
+            check_vals = band_vals[seg_s : seg_e + 1].copy()
+            if check_vals.size == 0: continue
+            
+            b_range = float(np.max(check_vals)) - float(np.min(check_vals))
             
             # K-point resolution 한계를 고려하여 b_range > 2.5 이면 0~pi를 횡단한 것으로 인정
             if b_range >= 2.5:
-                 # 밴드가 가장 평평한(Dispersion X가 가장 급격하게 변하는) 위치를 찾음
+                 # 밴드가 가장 평평한 위치를 찾음
                  diffs = np.abs(np.diff(check_vals))
-                 max_diff_idx = np.argmax(diffs)
-                 
-                 # 변동이 일어나는 두 포인트 중 뒤쪽(혹은 앞쪽)을 중심점으로 잡음
-                 center_idx = check_s + seg_s + max_diff_idx
-                 
-                 # 만약 해당 인덱스가 밴드갭을 벗어났다면 갭 안쪽으로 조정
-                 if center_idx < F and not uc_gap[center_idx]:
-                     if center_idx + 1 < F and uc_gap[center_idx + 1]:
-                         center_idx += 1
-                     elif center_idx - 1 >= 0 and uc_gap[center_idx - 1]:
-                         center_idx -= 1
-                 
-                 if 0 <= center_idx < F and uc_gap[center_idx]:
-                     # 밴드갭 끝단(위/아래 모서리)에 너무 바싹 붙어있는 밴드는 결함으로 보지 않음 (기본 마진 5칸)
-                     margin = max(5, bandgap_margin_bins)
-                     if (center_idx - g_start >= margin) and (g_end - center_idx >= margin):
-                         mask[center_idx] = 2
+                 if diffs.size > 0:
+                     max_diff_idx = np.argmax(diffs)
+                     center_idx = check_s + seg_s + max_diff_idx
+                     
+                     if center_idx < _length and not uc_gap[center_idx]:
+                         if center_idx + 1 < _length and uc_gap[center_idx + 1]:
+                             center_idx += 1
+                         elif center_idx - 1 >= 0 and uc_gap[center_idx - 1]:
+                             center_idx -= 1
+                     
+                     if 0 <= center_idx < _length and uc_gap[center_idx]:
+                         margin = max(5, bandgap_margin_bins)
+                         if (center_idx - g_start >= margin) and (g_end - center_idx >= margin):
+                             mask[center_idx] = 2
 
     return mask
 

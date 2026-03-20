@@ -60,39 +60,41 @@ class VAE_Encoder(nn.Module):
         # x_seq: [B, L, 6] (E, rho, L, Z, v, t)
         B = x_seq.size(0)
         valid_len = n_cells.long().clamp(min=1)
-        
+
         # 1. Input Projection
-        x = self.input_proj(x_seq) # [B, L, D]
-        
+        x = self.input_proj(x_seq)  # [B, L, D]
+
         # 2. Prepend [CLS] token
-        cls_tokens = self.cls_token.expand(B, -1, -1) # [B, 1, D]
-        x = torch.cat((cls_tokens, x), dim=1)         # [B, L+1, D]
-        
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, D]
+        x = torch.cat((cls_tokens, x), dim=1)          # [B, L+1, D]
+
         x = self.pos_enc(x)
-        
+
         # 3. Create Padding Mask (CLS is always valid)
-        # valid_len refers to the original sequence length.
-        # We have L+1 tokens. Indices: 0 (CLS), 1..L (Data)
-        # Valid indices: 0 .. valid_len
-        # Padding indices: valid_len+1 .. L
+        # Index 0 is CLS: the formula idx >= (valid_len+1) always keeps idx=0 as False (valid).
         L_plus_1 = x.size(1)
-        idx = torch.arange(L_plus_1, device=x.device).unsqueeze(0) # [1, L+1]
-        # valid_len is [B], we need to allow index 0 (CLS) and 1..valid_len
-        # So effective valid count is valid_len + 1
+        idx = torch.arange(L_plus_1, device=x.device).unsqueeze(0)  # [1, L+1]
         src_key_padding_mask = idx >= (valid_len.unsqueeze(1) + 1)
-        
+
+        # 💡 [Fix] Belt-and-suspenders ALL-masked guard: even though CLS (idx=0) is
+        #    always valid by construction above, guard explicitly to prevent future
+        #    refactor bugs and match pncformer.py protection style.
+        src_key_padding_mask = src_key_padding_mask.clone()
+        all_masked = src_key_padding_mask.all(dim=-1)  # [B]
+        if all_masked.any():
+            src_key_padding_mask[all_masked, 0] = False  # Keep CLS valid
+
         # 4. Transformer Encoder
-        x = self.tr_enc(x, src_key_padding_mask=src_key_padding_mask) # [B, L+1, D]
-        
+        x = self.tr_enc(x, src_key_padding_mask=src_key_padding_mask)  # [B, L+1, D]
+
         # 5. Pooling: Use [CLS] token (index 0)
-        pooled = x[:, 0, :] # [B, D]
-        
-        # 💡 [Change] Directly map pooled [CLS] to mu/logvar. 
-        # Materials are already processed inside the Transformer via x_seq.
+        pooled = x[:, 0, :]  # [B, D]
+
         pooled_norm = self.norm_pooled(pooled)
         mu = self.fc_mean(pooled_norm)
         logvar = self.fc_logvar(pooled_norm)
         return mu, logvar
+
 
 
 class VAE_Decoder(nn.Module):
@@ -122,13 +124,22 @@ class VAE_Decoder(nn.Module):
         nc_embed = self.ncells_embed(n_cells); c_token = mat_embed + nc_embed
         memory = torch.stack([z_token, c_token], dim=1)
         L = self.max_cells; idx = torch.arange(L, device=z.device).unsqueeze(0)
-        tgt_key_padding_mask = idx >= valid_len.unsqueeze(1)
+        tgt_key_padding_mask = idx >= valid_len.unsqueeze(1)  # True = ignored
+
+        # 💡 [Fix] ALL-masked row protection: if valid_len=1 (min), index 0 is valid.
+        #    But if any row somehow has ALL True, force first token valid to prevent
+        #    softmax(-inf)=NaN → C++ kernel state corruption → segfault.
+        tgt_key_padding_mask = tgt_key_padding_mask.clone()
+        all_masked = tgt_key_padding_mask.all(dim=-1)  # [B]
+        if all_masked.any():
+            tgt_key_padding_mask[all_masked, 0] = False
+
         out = self.decoder(
             tgt=query, memory=memory, tgt_mask=None,
             tgt_key_padding_mask=tgt_key_padding_mask
         )
         out = self.norm_out(out)
-        recon_lengths = self.output_head(out) # [B, L, 1], 범위 [-1, 1]
+        recon_lengths = self.output_head(out)  # [B, L, 1], 범위 [-1, 1]
         recon_lengths = recon_lengths.masked_fill(tgt_key_padding_mask.unsqueeze(-1), 0.0)
         return recon_lengths
 
@@ -280,15 +291,13 @@ class VAEDataset(Dataset):
         x_seq_6 = np.stack([X1, X2, X3, X4, X5, X6], axis=1) # [L, 6]
         
         return {
-            "x_seq": torch.from_numpy(x_seq_6.astype(np.float32)), # [L, 6]
-            "lengths": torch.from_numpy(lengths_seq_scaled), # Target [L, 1]
-            "material_conds": torch.from_numpy(material_conds),
-            "lengths": torch.from_numpy(lengths_seq_scaled), # Target [L, 1]
+            "x_seq": torch.from_numpy(x_seq_6.astype(np.float32)),  # [L, 6]
+            "lengths": torch.from_numpy(lengths_seq_scaled),          # Target [L, 1]
             "material_conds": torch.from_numpy(material_conds),
             "N_cells": torch.tensor(n_cells, dtype=torch.long),
             # 💡 [New] Full Band Mask and Freqs (for Surrogate Classifier)
-            "band_mask": torch.from_numpy(self.M[idx]), # [K]
-            "freqs": torch.from_numpy(self.F[idx])      # [K]
+            "band_mask": torch.from_numpy(self.M[idx]),  # [K]
+            "freqs": torch.from_numpy(self.F[idx])       # [K]
         }
 
 
