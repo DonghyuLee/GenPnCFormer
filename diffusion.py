@@ -1073,7 +1073,15 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
             last_batch_loss = loss.item()
             pbar.set_postfix({"mae": f"{last_batch_loss:.4f}"})
             batch_idx += 1
-            
+
+            # 주기적 메모리 정리: 파편화 방지 (eval 루프와 동일 패턴)
+            if batch_idx % 100 == 0:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+
         # Validation (Run every epoch for better tracking)
         # Apply EMA weights before validation
         ema.apply_shadow(ddpm)

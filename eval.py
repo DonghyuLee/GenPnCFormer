@@ -24,11 +24,6 @@ import gc
 # Utils: masks & padding
 # ==============================================================================
 
-def get_mask(n_cells, L):
-    """[B] n_cells -> [B, L, 1] mask (True=valid)."""
-    idx = torch.arange(L, device=n_cells.device).unsqueeze(0)
-    mask = (idx < n_cells.unsqueeze(1)).unsqueeze(-1)
-    return mask
 
 def zero_pad_layers(layers: torch.Tensor, valid_mask_1D: torch.Tensor) -> torch.Tensor:
     """layers [B,L,3] * valid_mask_1D [B,L] -> pad구간 0."""
@@ -118,58 +113,6 @@ class TestDataset(Dataset):
             "freqs": torch.from_numpy(self.F[idx]),                                    # [K]
             "mat_name": self.mat_name,                                                 # str
         }
-
-
-# ==============================================================================
-# Length losses (geometry; optional diagnostics)
-# ==============================================================================
-
-def masked_mse_loss(pred_scaled, target_scaled, mask):
-    se = F.mse_loss(pred_scaled, target_scaled, reduction='none')
-    se = se * mask
-    return se.sum() / (mask.sum() + 1e-8)
-
-def masked_mae_loss(pred_scaled, target_scaled, mask):
-    ae = F.l1_loss(pred_scaled, target_scaled, reduction='none')
-    ae = ae * mask
-    return ae.sum() / (mask.sum() + 1e-8)
-
-def masked_mape_loss(pred_scaled, target_scaled, mask):
-    pred = unscale_from_tanh(pred_scaled)
-    targ = unscale_from_tanh(target_scaled)
-    ape = torch.abs((targ - pred) / (targ + 1e-8))
-    ape = ape * mask
-    return (ape.sum() / (mask.sum() + 1e-8)) * 100.0
-
-
-# ==============================================================================
-# Band-mask metrics
-# ==============================================================================
-
-def compute_bandmask_metrics(pred_mask: torch.Tensor,
-                             target_mask: torch.Tensor):
-    with torch.no_grad():
-        pred = pred_mask.long()
-        target = target_mask.long()
-        valid_mask = (target != 3)  # Don't Care mask
-
-        # Accuracy
-        if valid_mask.sum() > 0:
-            acc = (pred[valid_mask] == target[valid_mask]).float().mean().item()
-        else:
-            acc = 0.0
-
-        pred_def = (pred[valid_mask] == 2)
-        targ_def = (target[valid_mask] == 2)
-        tp = (pred_def & targ_def).sum().item()
-        fp = (pred_def & (~targ_def)).sum().item()
-        fn = ((~pred_def) & targ_def).sum().item()
-
-        prec = tp / (tp + fp + 1e-8)
-        rec  = tp / (tp + fn + 1e-8)
-        f1   = 2 * prec * rec / (prec + rec + 1e-8) if (tp + fp + fn) > 0 else 0.0
-
-    return {"acc": acc, "defect_prec": prec, "defect_rec": rec, "defect_f1": f1}
 
 
 # ==============================================================================
@@ -317,19 +260,24 @@ class SurrogateBandSolver:
         # valid_mask is True = Valid (Keep)
         # So we must pass ~valid_mask
         padding_mask = ~valid_mask
-        
+
         udr_pred = self.model_udr(X_feat, f, src_key_padding_mask=padding_mask)   # [B,K]
         sdr_pred = self.model_sdr(X_feat, f, src_key_padding_mask=padding_mask)   # [B,K]
-        
-        # T_pred is used for Transmittance if needed, but not for mask
-        # T_pred   = self.model_trans(X_feat, f, src_key_padding_mask=padding_mask) 
+
+        # GPU → CPU 전에 모든 CUDA 커널 완료를 보장
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        udr_np = udr_pred.detach().cpu().numpy()   # [B,K] — CPU copy
+        sdr_np = sdr_pred.detach().cpu().numpy()   # [B,K] — CPU copy
+
+        # GPU 텐서를 즉시 해제: 다음 루프 GC가 CUDA 실행 중에 해제하는 것을 방지
+        del udr_pred, sdr_pred, X_feat, f, padding_mask
 
         band_masks = []
         for i in range(B):
-            u_i = udr_pred[i].detach().cpu().numpy()
-            s_i = sdr_pred[i].detach().cpu().numpy()
-            band_masks.append(build_band_mask(u_i, s_i).astype(np.int64)) # Pass (UDR, SDR)
-        # Keep result on CPU — metrics only need numpy anyway
+            band_masks.append(build_band_mask(udr_np[i], sdr_np[i]).astype(np.int64))
+
         return torch.from_numpy(np.stack(band_masks, 0))
 
 
@@ -352,8 +300,18 @@ class TMMBandSolver:
         freqs is not strictly needed for TorchTMM init but we keep the signature.
         """
         B, L, _ = lengths_unscaled.shape
-        lengths_c = lengths_unscaled.squeeze(-1) # [B, L]
-        
+        lengths_c = lengths_unscaled.squeeze(-1).clone()  # [B, L]  — clone to allow masking
+
+        # ⚠️ 핵심 수정: VAE 디코더는 항상 max_cells(14)개 출력을 생성하지만
+        # 실제 구조는 n_cells 개의 레이어만 유효함.
+        # n_cells 이후의 위치는 VAE 출력의 쓰레기 값(작은 양수)이 남아있어
+        # TMM이 이를 유효한 레이어로 처리하면 유령 셀이 추가되는 버그 발생.
+        # → n_cells를 기준으로 패딩 위치를 0으로 마스킹해야 함.
+        layer_idx = torch.arange(L, device=lengths_c.device).unsqueeze(0)  # [1, L]
+        valid_mask = (layer_idx < n_cells.to(lengths_c.device).unsqueeze(1))  # [B, L]
+        lengths_c = lengths_c * valid_mask.float()  # 패딩 레이어 강제 0
+
+
         # We assume material_conds has (E1, rho1, E2, rho2)
         # However, they might be different per batch item. 
         # TorchTMM currently takes scalar modulus_A, density_A in init.
@@ -375,53 +333,63 @@ class TMMBandSolver:
         )
         
         K = tmm.f.shape[1]
-        
-        # Build UDR
+
+        # Identity matrix template
+        I_cell = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=self.device)
+        I_cell[..., 0, 0] = 1.0; I_cell[..., 1, 1] = 1.0
+
+        # Build UDR: TM_B @ TM_A (get_dispersion_relation_unitcell와 동일 순서)
         if L >= 2:
-            TM_A = tmm.TM(m_A, r_A, lengths_c[:, 0].unsqueeze(-1).double()) # [B, 1]
+            TM_A = tmm.TM(m_A, r_A, lengths_c[:, 0].unsqueeze(-1).double())
             TM_B = tmm.TM(m_B, r_B, lengths_c[:, 1].unsqueeze(-1).double())
-            T_udr = torch.matmul(TM_A, TM_B)
-            trace_udr = T_udr[..., 0, 0] + T_udr[..., 1, 1]
-            x_udr = torch.clamp(torch.real(trace_udr) / 2.0, -1.0, 1.0)
-            UDR_pred = torch.acos(x_udr).cpu().numpy() # [B, K]
+            T_udr = torch.matmul(TM_B, TM_A)   # BA 순서
+            x_udr = torch.clamp(torch.real(T_udr[..., 0, 0] + T_udr[..., 1, 1]) / 2.0, -1.0, 1.0)
+            UDR_pred = torch.acos(x_udr).cpu().numpy()  # [B, K]
         else:
             UDR_pred = np.zeros((B, K))
-            
-        # Build SDR
-        T_sdr = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=self.device)
-        T_sdr[..., 0, 0] = 1.0
-        T_sdr[..., 1, 1] = 1.0
-        
-        # Max cells to iterate
-        L_max = L
-        
-        for i in range(L_max):
-            use_mat2 = (i % 2 == 1)
-            mod = m_B if use_mat2 else m_A
-            rho = r_B if use_mat2 else r_A
-            l_i = lengths_c[:, i].unsqueeze(-1).double() # [B, 1]
-            
-            # Valid mask per item: is this layer index < n_cells * 2?
-            # Actually layers are already zero-padded/masked or length=0
-            valid_mask = (l_i.squeeze(-1) > 0) # [B]
-            TM_layer = tmm.TM(mod, rho, l_i) # [B, K, 2, 2]
-            
-            # Apply Identity matrix where layer is invalid (length 0)
-            TM_layer[~valid_mask] = T_sdr[0, :, :, :] * 0.0
-            TM_layer[~valid_mask, ..., 0, 0] = 1.0
-            TM_layer[~valid_mask, ..., 1, 1] = 1.0
-            
-            T_sdr = torch.matmul(T_sdr, TM_layer)
 
-        trace_sdr = T_sdr[..., 0, 0] + T_sdr[..., 1, 1]
-        x_sdr = torch.clamp(torch.real(trace_sdr) / 2.0, -1.0, 1.0)
-        SDR_pred = torch.acos(x_sdr).cpu().numpy() # [B, K]
-        
-        # Build Mask
+        # Build SDR: 셀 단위 (TM_B @ TM_A) 구성 후 역순 chain multiply
+        # get_dispersion_relation_supercell과 동일한 방식
+        num_cells = L // 2
+        cell_tms = []
+        for c in range(num_cells):
+            idx_A, idx_B = c * 2, c * 2 + 1
+            l_A = lengths_c[:, idx_A].unsqueeze(-1).double()
+            l_B = lengths_c[:, idx_B].unsqueeze(-1).double()
+            valid_A = (l_A.squeeze(-1) > 0)
+            valid_B = (l_B.squeeze(-1) > 0)
+            TM_layer_A = tmm.TM(m_A, r_A, l_A)
+            TM_layer_B = tmm.TM(m_B, r_B, l_B)
+            TM_layer_A[~valid_A] = I_cell[~valid_A]
+            TM_layer_B[~valid_B] = I_cell[~valid_B]
+            cell_tms.append(torch.matmul(TM_layer_B, TM_layer_A))   # BA 순서
+
+        # 역순으로 chain multiply: T = I @ cell[N-1] @ ... @ cell[0]
+        T_sdr = I_cell.clone()
+        for cell_tm in reversed(cell_tms):
+            T_sdr = torch.matmul(T_sdr, cell_tm)
+
+        x_sdr = torch.clamp(torch.real(T_sdr[..., 0, 0] + T_sdr[..., 1, 1]) / 2.0, -1.0, 1.0)
+
+        # GPU → CPU 변환 전 모든 CUDA 커널 완료 보장
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        UDR_np = torch.acos(x_udr).cpu().numpy() if L >= 2 else np.zeros((B, K))
+        SDR_np = torch.acos(x_sdr).cpu().numpy()  # [B, K]
+
+        # GPU 텐서 즉시 해제: scipy.find_peaks 호출 전에 CUDA 메모리 오염 방지
+        del tmm, I_cell, cell_tms, T_sdr, x_sdr
+        if L >= 2:
+            del TM_A, TM_B, T_udr, x_udr
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Build Mask (pure CPU/numpy — scipy.find_peaks 사용)
         band_masks = []
         for i in range(B):
-            band_masks.append(build_band_mask(UDR_pred[i], SDR_pred[i]).astype(np.int64))
-            
+            band_masks.append(build_band_mask(UDR_np[i], SDR_np[i]).astype(np.int64))
+
         return torch.from_numpy(np.stack(band_masks, 0))
 
 
@@ -625,6 +593,10 @@ def run_inference_and_evaluation(cfg, device,
             if torch.isnan(lengths_fp32).any() or torch.isinf(lengths_fp32).any():
                 print(f"\n[Error] NaN/Inf detected in predicted lengths at batch. Filling with zeros.")
                 lengths_fp32 = torch.nan_to_num(lengths_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # band_solver 호출 전 이전 루프의 CUDA 잔류 작업 완료 보장
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
             band_mask_pred = band_solver(
                 lengths_fp32, material_conds_fp32, n_cells, freqs,
@@ -906,46 +878,56 @@ def visualize_dispersion_comparison(cfg, device,
         layers = zero_pad_layers(layers, valid_mask)
         return layers, valid_mask
 
-    def tr_from_layers(layers, f, valid_mask, mat_conds):
-        if use_tmm:
-            # For TR visualization, we need TorchTMM.get_transmittance
-            B = layers.shape[0]; K = f.shape[1]
-            m_A, r_A = mat_conds[0,0].item() * 1e9, mat_conds[0,1].item()
-            m_B, r_B = mat_conds[0,2].item() * 1e9, mat_conds[0,3].item()
-            tmm = TorchTMM(m_A, r_A, m_B, r_B, B, 100.0, 50000.0, 100.0, device=device)
-            # TorchTMM.get_transmittance needs length_A..D and 'case' dict
-            # For simplicity, we can use the manual chain multiplication logic from run_inverse_design
-            # but since we only need it for viz, maybe surrogate is enough or we implement it.
-            # actually if use_tmm is True, let's skip TR surrogate and just show TMM TR.
-            # But the Viz panel 3 is SDR (Dispersion), not TR. Panel 3 is axR.
-            # Let's check _viz_one_sample layout.
-            return np.zeros(K) # Default to zero if not implemented
-        X = layers_to_six_features_torch(layers)
-        padding_mask = ~valid_mask
-        return model_tr(X, f, src_key_padding_mask=padding_mask).squeeze(0).detach().cpu().numpy()
+
+    def _tmm_udr_sdr(layers, m_A, r_A, m_B, r_B):
+        """UDR/SDR을 get_dispersion_relation_supercell과 동일한 순서로 계산.
+        SDR: 셀 단위로 (TM_B @ TM_A) 구성 후 역순(마지막 셀부터) chain multiply.
+        """
+        B = layers.shape[0]; L = layers.shape[1]
+        lengths_c = layers[..., 2]
+        tmm = TorchTMM(m_A, r_A, m_B, r_B, B, 100.0, 50000.0, 100.0, device=device)
+        K = tmm.f.shape[1]
+        I_cell = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=device)
+        I_cell[..., 0, 0] = 1.0; I_cell[..., 1, 1] = 1.0
+
+        # UDR: TM_B @ TM_A (참조 구현과 동일)
+        TM_A0 = tmm.TM(m_A, r_A, lengths_c[:, 0].unsqueeze(-1).double())
+        TM_B1 = tmm.TM(m_B, r_B, lengths_c[:, 1].unsqueeze(-1).double())
+        T_udr = torch.matmul(TM_B1, TM_A0)
+        x_udr = torch.clamp(torch.real(T_udr[..., 0, 0] + T_udr[..., 1, 1]) / 2., -1., 1.)
+        U_np = torch.acos(x_udr).cpu().numpy()[0]  # [K]
+
+        # SDR: 셀 단위 (TM_B[2c+1] @ TM_A[2c]) 구성, 역순 chain multiply
+        num_cells = L // 2
+        cell_tms = []
+        for c in range(num_cells):
+            idx_A, idx_B = c * 2, c * 2 + 1
+            l_A = lengths_c[:, idx_A].unsqueeze(-1).double()
+            l_B = lengths_c[:, idx_B].unsqueeze(-1).double()
+            valid_A = (l_A.squeeze(-1) > 1e-8)
+            valid_B = (l_B.squeeze(-1) > 1e-8)
+            TM_layer_A = tmm.TM(m_A, r_A, l_A)
+            TM_layer_B = tmm.TM(m_B, r_B, l_B)
+            # 유효하지 않은 레이어는 항등행렬로 대체
+            TM_layer_A[~valid_A] = I_cell[~valid_A]
+            TM_layer_B[~valid_B] = I_cell[~valid_B]
+            cell_tm = torch.matmul(TM_layer_B, TM_layer_A)  # BA 순서
+            cell_tms.append(cell_tm)
+
+        # 역순으로 chain multiply: T = I @ cell[N-1] @ ... @ cell[0]
+        T_sdr = I_cell.clone()
+        for cell_tm in reversed(cell_tms):
+            T_sdr = torch.matmul(T_sdr, cell_tm)
+
+        x_sdr = torch.clamp(torch.real(T_sdr[..., 0, 0] + T_sdr[..., 1, 1]) / 2., -1., 1.)
+        S_np = torch.acos(x_sdr).cpu().numpy()[0]  # [K]
+        return U_np, S_np
 
     def band_from_layers(layers, f, valid_mask, mat_conds):
         if use_tmm:
             m_A, r_A = mat_conds[0,0].item() * 1e9, mat_conds[0,1].item()
             m_B, r_B = mat_conds[0,2].item() * 1e9, mat_conds[0,3].item()
-            B = layers.shape[0]; L = layers.shape[1]
-            tmm = TorchTMM(m_A, r_A, m_B, r_B, B, 100.0, 50000.0, 100.0, device=device)
-            K = tmm.f.shape[1]
-            lengths_c = layers[..., 2]
-            # UDR
-            TM_A = tmm.TM(m_A, r_A, lengths_c[:, 0].unsqueeze(-1).double())
-            TM_B = tmm.TM(m_B, r_B, lengths_c[:, 1].unsqueeze(-1).double())
-            T_udr = torch.matmul(TM_A, TM_B); x_udr = torch.clamp(torch.real(T_udr[...,0,0]+T_udr[...,1,1])/2., -1., 1.)
-            U_np = torch.acos(x_udr).cpu().numpy()[0]
-            # SDR
-            T_sdr = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=device)
-            T_sdr[..., 0, 0] = 1.0; T_sdr[..., 1, 1] = 1.0
-            for i in range(L):
-                use_mat2 = (i % 2 == 1); mod = m_B if use_mat2 else m_A; rho = r_B if use_mat2 else r_A
-                l_i = lengths_c[:, i].unsqueeze(-1).double(); valid_m = (l_i.squeeze(-1) > 1e-8)
-                TM_l = tmm.TM(mod, rho, l_i); TM_l[~valid_m] = T_sdr[0,:,:,:]*0.0; TM_l[~valid_m,...,0,0]=1.0; TM_l[~valid_m,...,1,1]=1.0
-                T_sdr = torch.matmul(T_sdr, TM_l)
-            S_np = torch.acos(torch.clamp(torch.real(T_sdr[...,0,0]+T_sdr[...,1,1])/2., -1., 1.)).cpu().numpy()[0]
+            U_np, S_np = _tmm_udr_sdr(layers, m_A, r_A, m_B, r_B)
             return build_band_mask(U_np, S_np).astype(np.int64)
         X = layers_to_six_features_torch(layers)
         padding_mask = ~valid_mask
@@ -957,17 +939,8 @@ def visualize_dispersion_comparison(cfg, device,
         if use_tmm:
             m_A, r_A = mat_conds[0,0].item() * 1e9, mat_conds[0,1].item()
             m_B, r_B = mat_conds[0,2].item() * 1e9, mat_conds[0,3].item()
-            B = layers.shape[0]; K = f.shape[1]; L = layers.shape[1]
-            tmm = TorchTMM(m_A, r_A, m_B, r_B, B, 100.0, 50000.0, 100.0, device=device)
-            lengths_c = layers[..., 2]
-            T_sdr = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=device)
-            T_sdr[..., 0, 0] = 1.0; T_sdr[..., 1, 1] = 1.0
-            for i in range(L):
-                use_mat2 = (i % 2 == 1); mod = m_B if use_mat2 else m_A; rho = r_B if use_mat2 else r_A
-                l_i = lengths_c[:, i].unsqueeze(-1).double(); valid_m = (l_i.squeeze(-1) > 1e-8)
-                TM_l = tmm.TM(mod, rho, l_i); TM_l[~valid_m] = T_sdr[0,:,:,:]*0.0; TM_l[~valid_m,...,0,0]=1.0; TM_l[~valid_m,...,1,1]=1.0
-                T_sdr = torch.matmul(T_sdr, TM_l)
-            return torch.acos(torch.clamp(torch.real(T_sdr[...,0,0]+T_sdr[...,1,1])/2., -1., 1.)).cpu().numpy()[0]
+            _, S_np = _tmm_udr_sdr(layers, m_A, r_A, m_B, r_B)
+            return S_np
         X = layers_to_six_features_torch(layers)
         padding_mask = ~valid_mask
         return model_sdr(X, f, src_key_padding_mask=padding_mask).squeeze(0).detach().cpu().numpy()
@@ -1157,7 +1130,7 @@ def visualize_dispersion_comparison(cfg, device,
         
         # --- Text: Design Parameters ---
         def fmt_arr(arr):
-            return "[" + ", ".join([f"{x:.3f}" for x in arr]) + "]"
+            return "[" + ", ".join([f"{x:.6f}" for x in arr]) + "]"
         valid_m = (M_cond != 3)
         acc = np.mean(band_gen[valid_m] == M_cond[valid_m]) * 100 if valid_m.sum() > 0 else 0.0
         param_str = f"GT: {fmt_arr(L_gt)}\nGen: {fmt_arr(L_gen)}\nAcc: {acc:.1f}%"
@@ -1233,34 +1206,6 @@ def visualize_dispersion_comparison(cfg, device,
 
 
     # --------------------------------------------------------------------------------------
-
-@torch.no_grad()
-def _defect_metrics_batch(pred_mask: torch.Tensor, target_mask: torch.Tensor):
-    """
-    pred_mask, target_mask: [B, K], 값 {0,1,2}
-    배치 단위로 TP/FP/FN/총개수와 결함(2) 분포를 리턴
-    """
-    pred = pred_mask.long()
-    targ = target_mask.long()
-
-    pred_def = (pred == 2)
-    targ_def = (targ == 2)
-
-    tp = (pred_def & targ_def).sum().item()
-    fp = (pred_def & (~targ_def)).sum().item()
-    fn = ((~pred_def) & targ_def).sum().item()
-
-    # 결함 비율 파악용
-    pred_def_cnt = pred_def.sum().item()
-    targ_def_cnt = targ_def.sum().item()
-    total_elems  = pred.numel()
-
-    return dict(
-        tp=tp, fp=fp, fn=fn,
-        pred_def_cnt=pred_def_cnt,
-        targ_def_cnt=targ_def_cnt,
-        total=total_elems
-    )
 
 def _mask_to_intervals_1d(freqs: np.ndarray,
                           mask: np.ndarray,
@@ -1415,337 +1360,3 @@ def _dma_batch(pred_mask: torch.Tensor,
         n_samples += 1
     return {"match_sum": match_sum, "n_samples": n_samples}
 
-
-def _greedy_match_intervals(pred_intervals, gt_intervals, iou_thr=0.5):
-    """
-    예측/정답 구간 세트를 IoU 최대 기준으로 그리디 매칭.
-    return:
-      tp, fp, fn, matched_ious(list)
-    """
-    if len(pred_intervals) == 0 and len(gt_intervals) == 0:
-        return 0, 0, 0, []
-
-    used_p = set()
-    used_g = set()
-    pairs = []
-    # 모든 쌍의 IoU 계산 후 큰 것부터 매칭
-    for gi, g in enumerate(gt_intervals):
-        for pi, p in enumerate(pred_intervals):
-            iou = _interval_iou(p, g)
-            if iou > 0:
-                pairs.append((iou, pi, gi))
-    pairs.sort(reverse=True, key=lambda x: x[0])
-
-    matched_ious = []
-    for iou, pi, gi in pairs:
-        if iou < iou_thr:
-            break
-        if (pi in used_p) or (gi in used_g):
-            continue
-        used_p.add(pi); used_g.add(gi)
-        matched_ious.append(iou)
-
-    tp = len(matched_ious)
-    fp = len(pred_intervals) - tp
-    fn = len(gt_intervals) - tp
-    return tp, fp, fn, matched_ious
-
-
-def _match_intervals_tolerance(pred_intervals, gt_intervals, tol=0.5):
-    """
-    Match intervals based on CENTER distance <= tol.
-    Greedy match by closest distance.
-    tol: Tolerance for center distance (in frequency units, e.g. rad)
-    """
-    if len(pred_intervals) == 0 and len(gt_intervals) == 0:
-        return 0, 0, 0, []
-
-    # Calculate centers
-    p_centers = [(p[0] + p[1])/2.0 for p in pred_intervals]
-    g_centers = [(g[0] + g[1])/2.0 for g in gt_intervals]
-    
-    pairs = []
-    # Calculate all distances
-    for gi, gc in enumerate(g_centers):
-        for pi, pc in enumerate(p_centers):
-            dist = abs(gc - pc)
-            if dist <= tol:
-                pairs.append((dist, pi, gi))
-    
-    # Sort by distance (ASCENDING) -> greedy match closest pairs
-    pairs.sort(key=lambda x: x[0])
-
-    used_p = set()
-    used_g = set()
-    matched_lists = [] # Store matched (pred, gt) or distances? user wants metrics. just count.
-    
-    for dist, pi, gi in pairs:
-        if (pi in used_p) or (gi in used_g):
-            continue
-        used_p.add(pi)
-        used_g.add(gi)
-        matched_lists.append(dist)
-        
-    tp = len(matched_lists)
-    fp = len(pred_intervals) - tp
-    fn = len(gt_intervals) - tp
-    
-    return tp, fp, fn, matched_lists
-
-
-@torch.no_grad()
-def interval_iou_metrics_batch(pred_mask: torch.Tensor,
-                               gt_mask: torch.Tensor,
-                               freqs: torch.Tensor,
-                               target_val: int = 2,
-                               iou_thr: float = 0.5,
-                               min_width: float = 0.0):
-    """
-    pred_mask, gt_mask: [B, K] (정수 라벨)
-    freqs:              [B, K] (실제 주파수 샘플)
-    interval IoU 기반 집계:
-      - 구간 매칭 TP/FP/FN (IoU>=thr)
-      - Precision / Recall / F1
-      - 평균 IoU (매칭된 쌍만)
-      - 샘플당 구간 개수 평균 등
-    """
-    assert pred_mask.shape == gt_mask.shape == freqs.shape
-    B, K = pred_mask.shape
-
-    tot_tp = tot_fp = tot_fn = 0
-    all_matched_ious = []
-    tot_pred_int = tot_gt_int = 0
-
-    pred_mask_np = pred_mask.detach().cpu().numpy().copy()
-    gt_mask_np   = gt_mask.detach().cpu().numpy()
-    freqs_np     = freqs.detach().cpu().numpy()
-    
-    # Ignore Don't Care (3) regions to prevent False Positives
-    pred_mask_np[gt_mask_np == 3] = 0
-
-    for b in range(B):
-        gis = _mask_to_intervals_1d(freqs_np[b], gt_mask_np[b],   target_val, min_width)
-        if len(gis) == 0:
-            continue # Skip samples where ground truth does not contain the target feature
-        pis = _mask_to_intervals_1d(freqs_np[b], pred_mask_np[b], target_val, min_width)
-        tp, fp, fn, matched_ious = _greedy_match_intervals(pis, gis, iou_thr=iou_thr)
-        tot_tp += tp; tot_fp += fp; tot_fn += fn
-        tot_pred_int += len(pis); tot_gt_int += len(gis)
-        all_matched_ious.extend(matched_ious)
-
-    prec = tot_tp / (tot_tp + tot_fp + 1e-8)
-    rec  = tot_tp / (tot_tp + tot_fn + 1e-8)
-    f1   = 2 * prec * rec / (prec + rec + 1e-8) if (tot_tp + tot_fp + tot_fn) > 0 else 0.0
-    mean_iou = (float(np.mean(all_matched_ious)) if len(all_matched_ious) > 0 else 0.0)
-
-    return {
-        "tp": tot_tp, "fp": tot_fp, "fn": tot_fn,
-        "precision": prec, "recall": rec, "f1": f1,
-        "mean_iou": mean_iou,
-        "pred_intervals": tot_pred_int, "gt_intervals": tot_gt_int,
-        "matched_pairs": len(all_matched_ious)
-    }
-
-
-@torch.no_grad()
-def defect_tolerance_metrics_batch(pred_mask: torch.Tensor,
-                                   gt_mask: torch.Tensor,
-                                   freqs: torch.Tensor,
-                                   tol: float = 0.5,
-                                   min_width: float = 0.0):
-    """
-    Class 2 (Defect) metrics using CENTER TOLERANCE matching.
-    """
-    B, K = pred_mask.shape
-    tot_tp = tot_fp = tot_fn = 0
-    tot_pred_int = tot_gt_int = 0
-    
-    pred_mask_np = pred_mask.detach().cpu().numpy().copy()
-    gt_mask_np   = gt_mask.detach().cpu().numpy()
-    freqs_np     = freqs.detach().cpu().numpy()
-    
-    # Ignore Don't Care (3) regions to prevent False Positives
-    pred_mask_np[gt_mask_np == 3] = 0
-    
-    target_val = 2 # Defect
-
-    for b in range(B):
-        gis = _mask_to_intervals_1d(freqs_np[b], gt_mask_np[b],   target_val, min_width)
-        if len(gis) == 0:
-            continue # Skip samples where ground truth does not contain the target feature
-        pis = _mask_to_intervals_1d(freqs_np[b], pred_mask_np[b], target_val, min_width)
-        
-        tp, fp, fn, _ = _match_intervals_tolerance(pis, gis, tol=tol)
-        
-        tot_tp += tp; tot_fp += fp; tot_fn += fn
-        tot_pred_int += len(pis); tot_gt_int += len(gis)
-
-    return {
-        "tp": tot_tp, "fp": tot_fp, "fn": tot_fn,
-        "pred_intervals": tot_pred_int,
-        "gt_intervals": tot_gt_int
-    }
-
-
-@torch.no_grad()
-def compare_condition_vs_surrogate_truth(
-    cfg,
-    device,
-    max_batches: int | None = None,
-    iou_thr: float = 0.5,
-    min_width: float = 0.0,
-    use_tmm: bool = False,
-    test_paths: list | None = None,
-):
-    """
-    Test set에 대해:
-      - surrogate(UDR/TR)로 '기존 설계안'의 응답 → build_band_mask → surrogate-truth mask
-      - condition으로 제공한 band mask와 직접 비교
-
-    출력:
-      1) 포인트 단위(pnt-level): Acc / Defect Prec / Recall / F1
-      2) 구간 단위(interval-level): Precision / Recall / F1 / mean IoU
-         (IoU 임계치 iou_thr로 매칭, min_width 미만 구간은 무시)
-      3) 결함 비율 요약
-    """
-    # 1) Surrogate or TMM 준비
-    evaluator_name = "TMM (Exact Physics)" if use_tmm else "Surrogate-Truth"
-    if use_tmm:
-        band_solver = TMMBandSolver(cfg, device)
-    else:
-        band_solver = SurrogateBandSolver(cfg, device)
-
-    # 2) Data
-    if test_paths:
-        paths = test_paths
-    else:
-        paths = [
-            os.path.join(cfg.cache_dir, f"{mat}_test_dispersion.npz")
-            for mat in ["CA", "SA", "TA", "AC", "AS", "AT"]
-            if os.path.exists(os.path.join(cfg.cache_dir, f"{mat}_test_dispersion.npz"))
-        ]
-        
-    print(f"[Eval Truth] Loading test data from {len(paths)} files...")
-    test_datasets = [TestDataset(p, cfg.max_cells) for p in paths]
-    test_ds = torch.utils.data.ConcatDataset(test_datasets)
-    test_dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
-
-    # -------------------------
-    # 누적 통계 (포인트 단위)
-    # -------------------------
-    total_prec = 0.0
-    total_rec  = 0.0
-    total_f1   = 0.0
-    num_samples = 0
-
-    # 결함 분포/혼동 일부 집계
-    total_tp = total_fp = total_fn = 0
-    total_pred_def = total_targ_def = 0
-    total_elems = 0
-
-    # -------------------------
-    # 누적 통계 (interval IoU)
-    # -------------------------
-    i_tot_tp = i_tot_fp = i_tot_fn = 0
-    i_tot_matched = 0
-    i_all_matched_ious_sum = 0.0  # mean IoU 계산용 (배치별이 아닌 전체 매칭쌍 평균)
-    i_tot_pred_int = i_tot_gt_int = 0
-
-    pbar = tqdm(test_dl, desc="[Cond vs SurrogateTruth + Interval IoU]")
-
-    for b_idx, batch in enumerate(pbar):
-        lengths_true_scaled = batch["lengths_true_scaled"].to(device)  # [B,L,1]
-        material_conds = batch["material_conds"].to(device)            # [B,4]
-        n_cells = torch.clamp(batch["n_cells"].to(device), min=1)      # [B]
-        band_mask_cond = batch["band_mask"].to(device)                 # [B,K]
-        freqs = batch["freqs"].to(device)                              # [B,K]
-        B = lengths_true_scaled.size(0)
-
-        # surrogate-truth mask (기존 설계안 길이 사용)
-        lengths_true_unscaled = unscale_from_tanh(lengths_true_scaled)  # [B,L,1]
-        band_mask_truth = band_solver(
-            lengths_unscaled=lengths_true_unscaled,
-            material_conds=material_conds,
-            n_cells=n_cells,
-            freqs=freqs,   # [B,K]
-        ).to(device)  # [B,K]
-
-        # ---------- 포인트 단위 메트릭 ----------
-        metrics = compute_bandmask_metrics(band_mask_truth, band_mask_cond)
-        total_prec += metrics["defect_prec"] * B
-        total_rec  += metrics["defect_rec"] * B
-        total_f1   += metrics["defect_f1"] * B
-        num_samples += B
-
-        # 결함 분포/혼동 집계
-        d = _defect_metrics_batch(band_mask_truth, band_mask_cond)
-        total_tp       += d["tp"]
-        total_fp       += d["fp"]
-        total_fn       += d["fn"]
-        total_pred_def += d["pred_def_cnt"]
-        total_targ_def += d["targ_def_cnt"]
-        total_elems    += d["total"]
-
-        # ---------- Interval IoU 메트릭 ----------
-        i_metrics = interval_iou_metrics_batch(
-            pred_mask=band_mask_truth,   # surrogate-truth vs condition (둘 중 어떤걸 pred로 둬도 TP/FP/FN은 동일)
-            gt_mask=band_mask_cond,
-            freqs=freqs,                 # [B,K]
-            target_val=2,
-            iou_thr=iou_thr,
-            min_width=min_width,
-        )
-        i_tot_tp       += i_metrics["tp"]
-        i_tot_fp       += i_metrics["fp"]
-        i_tot_fn       += i_metrics["fn"]
-        i_tot_pred_int += i_metrics["pred_intervals"]
-        i_tot_gt_int   += i_metrics["gt_intervals"]
-
-        # mean IoU 누적 (매칭된 쌍 수 * 평균값 = 총 합)
-        i_all_matched_ious_sum += i_metrics["mean_iou"] * i_metrics["matched_pairs"]
-        i_tot_matched          += i_metrics["matched_pairs"]
-
-        pbar.set_postfix(
-            pF1=f"{(total_f1/num_samples):.4f}",  # point-level F1
-            iF1=f"{( (2*(i_tot_tp)/(2*i_tot_tp + i_tot_fp + i_tot_fn + 1e-8)) ):.4f}",  # interval-level F1 계산식과 동일
-        )
-
-        if (max_batches is not None) and (b_idx + 1 >= max_batches):
-            break
-
-    if num_samples == 0:
-        print("No test samples.")
-        return
-
-    # ---------- 최종 집계 (포인트 단위) ----------
-    avg_prec = total_prec / num_samples
-    avg_rec  = total_rec  / num_samples
-    avg_f1   = total_f1   / num_samples
-
-    pred_def_ratio = total_pred_def / max(total_elems, 1)
-    targ_def_ratio = total_targ_def / max(total_elems, 1)
-
-    # ---------- 최종 집계 (interval IoU) ----------
-    i_prec = i_tot_tp / (i_tot_tp + i_tot_fp + 1e-8)
-    i_rec  = i_tot_tp / (i_tot_tp + i_tot_fn + 1e-8)
-    i_f1   = 2 * i_prec * i_rec / (i_prec + i_rec + 1e-8) if (i_tot_tp + i_tot_fp + i_tot_fn) > 0 else 0.0
-    i_mean_iou = (i_all_matched_ious_sum / i_tot_matched) if i_tot_matched > 0 else 0.0
-
-    print(f"\n--- Condition vs {evaluator_name} (band mask) ---")
-    print(f"Total Test Samples: {num_samples}")
-    
-    print("\n[Metrics] 1) Bandgap (Class 1) - Only for samples with Target Bandgap")
-    print(f"[Point]   Defect Prec:  {avg_prec:.4f}")
-    print(f"[Point]   Defect Rec:   {avg_rec:.4f}")
-    print(f"[Point]   Defect F1:    {avg_f1:.4f}")
-    print(f"          TP / FP / FN: {total_tp} / {total_fp} / {total_fn}")
-    print(f"          Defect ratio  (predicted)      : {pred_def_ratio*100:.2f}%")
-    print(f"          Defect ratio  (condition mask) : {targ_def_ratio*100:.2f}%")
-
-    print(f"\n[Interval IoU]  thr={iou_thr:.2f}, min_width={min_width:.5f}")
-    print(f"          Precision:    {i_prec:.4f}")
-    print(f"          Recall:       {i_rec:.4f}")
-    print(f"          F1:           {i_f1:.4f}")
-    print(f"          Mean IoU*:    {i_mean_iou:.4f}   (*matched pairs only)")
-    print(f"          Pred/GT intervals: {i_tot_pred_int} / {i_tot_gt_int}")
-    print(f"          Matched pairs:     {i_tot_matched}")

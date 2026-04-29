@@ -12,11 +12,53 @@ from sklearn.decomposition import PCA
 from config import CFG
 from vae import VAE_Decoder
 from diffusion import DDPM, DiffusionTransformer, UNet1D
-from eval import unscale_from_tanh, TestDataset, \
-    _mask_to_intervals_1d, _greedy_match_intervals, _match_intervals_tolerance
-from data_utils import visualize_sample_paper, build_band_mask
+from eval import unscale_from_tanh, TestDataset, _mask_to_intervals_1d, _interval_iou
+from data_utils import build_band_mask
 from data_generation.tmm_torch import TorchTMM
 
+
+# ── interval matching helpers (previously in eval.py) ────────────────────────
+def _greedy_match_intervals(pred_intervals, gt_intervals, iou_thr=0.5):
+    """IoU 최대 기준 그리디 매칭. Returns (tp, fp, fn, matched_ious)."""
+    if len(pred_intervals) == 0 and len(gt_intervals) == 0:
+        return 0, 0, 0, []
+    used_p, used_g, pairs = set(), set(), []
+    for gi, g in enumerate(gt_intervals):
+        for pi, p in enumerate(pred_intervals):
+            iou = _interval_iou(p, g)
+            if iou > 0:
+                pairs.append((iou, pi, gi))
+    pairs.sort(reverse=True, key=lambda x: x[0])
+    matched_ious = []
+    for iou, pi, gi in pairs:
+        if iou < iou_thr:
+            break
+        if (pi in used_p) or (gi in used_g):
+            continue
+        used_p.add(pi); used_g.add(gi)
+        matched_ious.append(iou)
+    tp = len(matched_ious)
+    return tp, len(pred_intervals) - tp, len(gt_intervals) - tp, matched_ious
+
+
+def _match_intervals_tolerance(pred_intervals, gt_intervals, tol=0.5):
+    """Center distance <= tol 기준 그리디 매칭. Returns (tp, fp, fn, dists)."""
+    if len(pred_intervals) == 0 and len(gt_intervals) == 0:
+        return 0, 0, 0, []
+    p_c = [(p[0]+p[1])/2.0 for p in pred_intervals]
+    g_c = [(g[0]+g[1])/2.0 for g in gt_intervals]
+    pairs = [(abs(gc-pc), pi, gi)
+             for gi, gc in enumerate(g_c)
+             for pi, pc in enumerate(p_c) if abs(gc-pc) <= tol]
+    pairs.sort(key=lambda x: x[0])
+    used_p, used_g, matched = set(), set(), []
+    for dist, pi, gi in pairs:
+        if (pi in used_p) or (gi in used_g):
+            continue
+        used_p.add(pi); used_g.add(gi)
+        matched.append(dist)
+    tp = len(matched)
+    return tp, len(pred_intervals) - tp, len(gt_intervals) - tp, matched
 
 
 def build_scenario_masks(k_points=500, f_start=100.0, f_step=100.0):
@@ -53,20 +95,20 @@ def build_scenario_masks(k_points=500, f_start=100.0, f_step=100.0):
         "mat": "TA", "nc": 5
     })
 
-    # 3) single defect-band matching (in a 25-35 bandgap)
+    # 3) single defect-band matching (in a 30-40 bandgap)
     mask3 = np.full(k_points, 3, dtype=np.int32)
-    f1, f2 = 25, 35
+    f1, f2 = 30, 40
     idx1, idx2 = freq_to_idx(f1), freq_to_idx(f2)
     pad_start = max(0, idx1 - 20)
     pad_end = min(k_points, idx2 + 20)
     mask3[pad_start:idx1] = 0
     mask3[idx2:pad_end] = 0
     mask3[idx1:idx2] = 1
-    f = 30
+    f = 35
     d_idx = freq_to_idx(f)
     mask3[d_idx] = 2
     scenarios.append({
-        "name": "3_SingleDefect_30kHz_in_25_35", "mask": mask3, "type": "defect", "targets": [30],
+        "name": "3_SingleDefect_35kHz_in_30_40", "mask": mask3, "type": "defect", "targets": [35],
         "mat": "CA", "nc": 6
     })
 
@@ -163,49 +205,50 @@ def batched_tmm_evaluation(lengths_c, nc, modulus_A, density_A, modulus_B, densi
     )
     
     K = tmm.f.shape[1]
-    
-    # --- 1) Compute UDR (Using first two layers as the representative unit cell) ---
+
+    # Identity matrix template
+    I_cell = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=device)
+    I_cell[..., 0, 0] = 1.0; I_cell[..., 1, 1] = 1.0
+
+    # --- 1) Compute UDR: TM_B @ TM_A (get_dispersion_relation_unitcell와 동일 순서) ---
     if L_max >= 2:
-        TM_A = tmm.TM(modulus_A, density_A, lengths_c[:, 0].double()) # [B, 1]
-        TM_B = tmm.TM(modulus_B, density_B, lengths_c[:, 1].double())
-        T_udr = torch.matmul(TM_A, TM_B)
-        trace_udr = T_udr[..., 0, 0] + T_udr[..., 1, 1]
-        x_udr = torch.clamp(torch.real(trace_udr) / 2.0, -1.0, 1.0)
-        UDR_pred = torch.acos(x_udr).cpu().numpy() # [B, K]
+        TM_A0 = tmm.TM(modulus_A, density_A, lengths_c[:, 0].double())
+        TM_B1 = tmm.TM(modulus_B, density_B, lengths_c[:, 1].double())
+        T_udr = torch.matmul(TM_B1, TM_A0)   # BA 순서
+        x_udr = torch.clamp(torch.real(T_udr[..., 0, 0] + T_udr[..., 1, 1]) / 2.0, -1.0, 1.0)
+        UDR_pred = torch.acos(x_udr).cpu().numpy()  # [B, K]
     else:
         UDR_pred = np.zeros((B, K))
-        
-    # --- 2) Compute SDR (Using all nc layers) ---
-    T_sdr = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=device)
-    T_sdr[..., 0, 0] = 1.0
-    T_sdr[..., 1, 1] = 1.0
-    
-    for i in range(L_max):
-        use_mat2 = (i % 2 == 1)
-        mod = modulus_B if use_mat2 else modulus_A
-        rho = density_B if use_mat2 else density_A
-        l_i = lengths_c[:, i].double() # [B, 1]
-        
-        # Valid layers only
-        valid_mask = (l_i.squeeze(-1) > 0) # [B]
-        TM_layer = tmm.TM(mod, rho, l_i) # [B, K, 2, 2]
-        
-        # Multiply only the valid ones
-        TM_layer[~valid_mask] = T_sdr[0, :, :, :] * 0.0
-        TM_layer[~valid_mask, ..., 0, 0] = 1.0
-        TM_layer[~valid_mask, ..., 1, 1] = 1.0
-        
-        T_sdr = torch.matmul(T_sdr, TM_layer)
 
-    trace_sdr = T_sdr[..., 0, 0] + T_sdr[..., 1, 1]
-    x_sdr = torch.clamp(torch.real(trace_sdr) / 2.0, -1.0, 1.0)
-    SDR_pred = torch.acos(x_sdr).cpu().numpy() # [B, K]
-    
+    # --- 2) Compute SDR: 셀 단위 (TM_B @ TM_A) 구성 후 역순 chain multiply ---
+    # get_dispersion_relation_supercell과 동일한 방식
+    num_cells = L_max // 2
+    cell_tms = []
+    for c in range(num_cells):
+        idx_A, idx_B = c * 2, c * 2 + 1
+        l_A = lengths_c[:, idx_A].double()
+        l_B = lengths_c[:, idx_B].double()
+        valid_A = (l_A.squeeze(-1) > 0)
+        valid_B = (l_B.squeeze(-1) > 0)
+        TM_layer_A = tmm.TM(modulus_A, density_A, l_A)
+        TM_layer_B = tmm.TM(modulus_B, density_B, l_B)
+        TM_layer_A[~valid_A] = I_cell[~valid_A]
+        TM_layer_B[~valid_B] = I_cell[~valid_B]
+        cell_tms.append(torch.matmul(TM_layer_B, TM_layer_A))   # BA 순서
+
+    # 역순으로 chain multiply: T = I @ cell[N-1] @ ... @ cell[0]
+    T_sdr = I_cell.clone()
+    for cell_tm in reversed(cell_tms):
+        T_sdr = torch.matmul(T_sdr, cell_tm)
+
+    x_sdr = torch.clamp(torch.real(T_sdr[..., 0, 0] + T_sdr[..., 1, 1]) / 2.0, -1.0, 1.0)
+    SDR_pred = torch.acos(x_sdr).cpu().numpy()  # [B, K]
+
     # --- 3) Convert to masks ---
     masks = np.zeros((B, K), dtype=np.int32)
     for i in range(B):
         masks[i] = build_band_mask(UDR_pred[i], SDR_pred[i])
-        
+
     return UDR_pred, SDR_pred, masks
 
 
@@ -349,34 +392,46 @@ def run_inverse_design(cfg, mode="adaln-zero"):
                 eval_start_time = time.time()
                 
                 # Evaluate constraints
+                # Evaluate constraints — collect metrics for ALL samples
                 success_samples = []
+                all_mbofs = []
+                all_dmas  = []  # only for defect scenarios
                 for i in range(B):
                     is_success, s_mbof, s_tol = check_success(band_mask_pred[i], scenario, freqs, iou_thr=0.5)
+                    all_mbofs.append(s_mbof)
+                    if scenario["type"] == "defect":
+                        all_dmas.append(s_tol if s_tol < 900.0 else None)  # 999=unmatched, skip
                     if is_success:
                         success_samples.append((i, s_mbof, s_tol))
                 eval_end_time = time.time()
-                                
+
+                # ── Per-scenario statistics (all B samples) ──────────────────
+                mbof_arr = np.array(all_mbofs)
+                print(f"\n    📊 [Stats over {B} samples]")
+                print(f"       mBOF  — max: {mbof_arr.max():.4f}  mean: {mbof_arr.mean():.4f}  min: {mbof_arr.min():.4f}")
+                if scenario["type"] == "defect":
+                    valid_dmas = [d for d in all_dmas if d is not None]
+                    if valid_dmas:
+                        dma_arr = np.array(valid_dmas)
+                        print(f"       DMA(tol kHz) — max: {dma_arr.max():.4f}  mean: {dma_arr.mean():.4f}  min: {dma_arr.min():.4f}")
+                    else:
+                        print(f"       DMA — no defect-matched samples")
+                # ─────────────────────────────────────────────────────────────
+
                 if len(success_samples) > 0:
                     print(f"    ✅ [SUCCESS] Found {len(success_samples)} matching structural designs on retry {attempt+1}!")
                     print(f"    ⏱️  Generation Time: {gen_end_time - gen_start_time:.2f}s | Evaluation Time: {eval_end_time - eval_start_time:.2f}s")
                     
-                    # 1. Select the "Best" sample (highest IoU, then lowest tolerance)
+                    # 1. Select the "Best" sample (highest mBOF, then lowest tolerance)
                     success_samples.sort(key=lambda x: (-float(x[1]), float(x[2])))
                     best_sample = success_samples[0]
-                    
-                    # 2. Find the sample furthest from the "Best" one in latent space
+
+                    # 2. Rank 2 = worst mBOF (last after descending sort)
                     if len(success_samples) > 1:
-                        success_indices_sorted = [x[0] for x in success_samples]
-                        z_feasible = z_all[success_indices_sorted] 
-                        z_best = z_feasible[0:1] # [1, dim]
-                        
-                        # Euclidean distance from best to all others
-                        dists = np.sum((z_feasible - z_best)**2, axis=1)
-                        furthest_idx = np.argmax(dists)
-                        top_samples = [best_sample, success_samples[furthest_idx]]
+                        top_samples = [best_sample, success_samples[-1]]
                     else:
                         top_samples = success_samples
-                    
+
                     success_indices = [x[0] for x in success_samples]
                     
 
@@ -465,7 +520,7 @@ def run_inverse_design(cfg, mode="adaln-zero"):
                         if L_gen_raw.ndim == 2: L_gen_raw = L_gen_raw[:, 0]  # [L,1] → [L]
                         L_gen_plot = L_gen_raw[L_gen_raw > 1e-6][:nc]
                         idx_gen    = np.arange(1, len(L_gen_plot)+1)
-                        axLen.plot(idx_gen, L_gen_plot, color='b', linestyle='-', marker='o', markersize=4)
+                        axLen.plot(idx_gen, L_gen_plot, color='b', linestyle=':', marker='x', markersize=4)
                         axLen.set_xlim(0, 15); axLen.set_xticks([0, 5, 10, 15])
                         axLen.set_ylim(0.0, 0.10)
                         axLen.tick_params(direction='in', which='both', top=False, right=False,
@@ -499,7 +554,12 @@ def run_inverse_design(cfg, mode="adaln-zero"):
                                     [y_bottom, y_bottom, y_bottom+height, y_bottom+height, y_bottom],
                                     color='k', linewidth=1.0)
     
-                        _draw_mask_strip(axM, mask_np,             0.0, 0.9)  # bottom: predicted
+                        # Generated mask: apply Don't Care from target scenario
+                        # so direct comparison is possible (same as eval.py)
+                        mask_np_viz = mask_np.copy()
+                        mask_np_viz[scenario["mask"] == 3] = 3
+
+                        _draw_mask_strip(axM, mask_np_viz,          0.0, 0.9)  # bottom: predicted
                         _draw_mask_strip(axM, scenario["mask"], 1.0, 0.9)  # top: target
                         axM.set_xlim(edges[0], edges[-1])
                         axM.set_ylim(0.0, 1.9)
@@ -523,7 +583,7 @@ def run_inverse_design(cfg, mode="adaln-zero"):
                             # Draw a star at the center x-axis value for visibility
                             axD.plot(np.pi/2, f_center, marker='*', markersize=12, color='g', zorder=3)
     
-                        axD.plot(sdr_pred_snap, freqs_np_vis, color='b', linestyle='-', linewidth=1.5)
+                        axD.plot(sdr_pred_snap, freqs_np_vis, color='b', linestyle=':', linewidth=1.5)
                         axD.set_xlim(0, np.pi)
                         axD.set_ylim(freqs_np_vis.min(), freqs_np_vis.max())
                         axD.tick_params(direction='in', which='both', top=False, right=False,
@@ -533,8 +593,9 @@ def run_inverse_design(cfg, mode="adaln-zero"):
                         for sp in axD.spines.values(): sp.set_visible(True)
                         axD.yaxis.set_major_locator(MaxNLocator(nbins=5))
     
+                        rank_label = "BEST" if rank == 0 else "WORST"
                         metric_label = f"mBOF (IoU): {b_mbof:.4f}" if scenario["type"] == "bandgap" else f"DMA (Tol): {b_tol:.4f}kHz, mBOF: {b_mbof:.4f}"
-                        caption = f"Mat: {mat}   Cells: {nc}   {metric_label} (Rank {rank+1})\nLengths: {[f'{x:.3f}' for x in len_np.tolist()]}"
+                        caption = f"Mat: {mat}   Cells: {nc}   {metric_label} (Rank {rank+1}: {rank_label})\nLengths: {[f'{x:.3f}' for x in len_np.tolist()]}"
 
                         fig.text(0.5, 0.02, caption, ha='center', va='bottom', fontsize=8, family='monospace')
     

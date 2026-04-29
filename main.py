@@ -190,19 +190,20 @@ if __name__ == "__main__":
             )
             print(f"[DDPM {mode.upper()}] Training finished. checkpoint: {ddpm_ckpt_path}")
 
-        # 5) 평가 
+
+        # 5) 결과 시각화 
+        vis_dir = f"vis_results_{mode}"apah
+        if args.use_tmm: vis_dir += "_tmm"
+        
+        visualize_dispersion_comparison(
+            cfg, device, save_dir=vis_dir, w_cfg=5.0,
+            diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path,
+            use_tmm=args.use_tmm
+        )
+        
+        # 6) 평가 
         run_inference_and_evaluation(
             cfg, device, min_width=0.0, w_cfg=5.0, ddim_steps=50, eta=0.0,
             test_paths=test_paths, diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path,
             use_tmm=args.use_tmm
         )
-
-        # 6) 결과 시각화 
-        # vis_dir = f"vis_results_{mode}"
-        # if args.use_tmm: vis_dir += "_tmm"
-        
-        # visualize_dispersion_comparison(
-        #     cfg, device, save_dir=vis_dir, w_cfg=5.0,
-        #     diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path,
-        #     use_tmm=args.use_tmm
-        # )

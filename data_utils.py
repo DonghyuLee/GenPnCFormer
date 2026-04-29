@@ -139,22 +139,33 @@ def build_band_mask(
             
             # K-point resolution 한계를 고려하여 b_range > 2.5 이면 0~pi를 횡단한 것으로 인정
             if b_range >= 2.5:
-                 # 밴드가 가장 평평한 위치를 찾음
-                 diffs = np.abs(np.diff(check_vals))
-                 if diffs.size > 0:
-                     max_diff_idx = np.argmax(diffs)
-                     center_idx = check_s + seg_s + max_diff_idx
-                     
-                     if center_idx < _length and not uc_gap[center_idx]:
-                         if center_idx + 1 < _length and uc_gap[center_idx + 1]:
-                             center_idx += 1
-                         elif center_idx - 1 >= 0 and uc_gap[center_idx - 1]:
-                             center_idx -= 1
-                     
-                     if 0 <= center_idx < _length and uc_gap[center_idx]:
-                         margin = max(5, bandgap_margin_bins)
-                         if (center_idx - g_start >= margin) and (g_end - center_idx >= margin):
-                             mask[center_idx] = 2
+                # 결함 공진 주파수 = SDR이 π/2를 교차하는 지점 (선형 보간)
+                # 결함 밴드는 SDR이 0→π (또는 π→0)를 완전히 횡단할 때 발생하며
+                # π/2 교차점이 결함 공진 주파수를 물리적으로 정확하게 나타냄.
+                half_pi = np.pi / 2.0
+                above = (check_vals > half_pi)
+                trans = np.where(np.diff(above.astype(np.int8)) != 0)[0]
+
+                if len(trans) > 0:
+                    ti = trans[0]   # π/2를 넘는 첫 번째 전환 인덱스
+                    v1, v2 = float(check_vals[ti]), float(check_vals[ti + 1])
+                    t = (half_pi - v1) / (v2 - v1) if abs(v2 - v1) > 1e-10 else 0.5
+                    center_idx = check_s + seg_s + int(round(ti + t))
+                else:
+                    # Fallback: π/2에 가장 가까운 bin
+                    center_idx = check_s + seg_s + int(np.argmin(np.abs(check_vals - half_pi)))
+
+                # center_idx가 uc_gap 경계에 걸릴 경우 1 bin 보정
+                if center_idx < _length and not uc_gap[center_idx]:
+                    if center_idx + 1 < _length and uc_gap[center_idx + 1]:
+                        center_idx += 1
+                    elif center_idx - 1 >= 0 and uc_gap[center_idx - 1]:
+                        center_idx -= 1
+
+                if 0 <= center_idx < _length and uc_gap[center_idx]:
+                    margin = max(5, bandgap_margin_bins)
+                    if (center_idx - g_start >= margin) and (g_end - center_idx >= margin):
+                        mask[center_idx] = 2
 
     return mask
 

@@ -15,8 +15,8 @@ print("Device:", device)
 class CFG:
     # Common Config
     data_dir: str = "data"
-    cache_dir: str = "data/cache_v2.3.0"
-    save_dir: str = "./checkpoints/v2.3.0"
+    cache_dir: str = "data/cache_v2.3.1"
+    save_dir: str = "./checkpoints/v2.3.1"
     target_folders: list = ("CA", "SA", "TA", "AC", "AS", "AT") # 💡 Multi-Material Support
 
     # Data Config
@@ -62,6 +62,6 @@ class CFG:
     warmup_epochs: int = 2 
     curriculum_switch_epoch: int = 100 
     latent_scale_factor: float = 5.04 
-    epochs_diffusion: int = 100 
+    epochs_diffusion: int = 200 
     cond_mode: str = "adaln-zero" 
    
