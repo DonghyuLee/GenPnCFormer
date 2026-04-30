@@ -1,7 +1,6 @@
 import os
-# 💡 [Fix] Expandable CUDA memory segments (PyTorch 2.1+): prevents heap fragmentation
-#    during long inference loops (2600+ batches × 50 DDIM steps each).
-#    MUST be set before `import torch` to take effect.
+# Enable expandable CUDA memory segments to prevent heap fragmentation
+# during long inference loops. Must be set before `import torch`.
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
@@ -35,14 +34,14 @@ if __name__ == "__main__":
     cfg = CFG()
     os.makedirs(cfg.save_dir, exist_ok=True)
 
-    # 1. 데이터 캐시 준비 (Returns lists of paths)
+    # 1. Data cache
     train_paths, valid_paths, test_paths = load_or_build_cache_multimat(cfg)
     
-    # 2) VAE 학습 및 로딩 (Architecture Mismatch 처리)
+    # 2. VAE training / loading
     vae_ckpt_path = os.path.join(cfg.save_dir, "vae_model_best.pt")
     vae = ConditionalVAE(cfg).to(device)
     
-    # Checkpoint 로딩 시도 (Architecture Mismatch 체크)
+    # Try loading existing checkpoint
     if os.path.exists(vae_ckpt_path):
         print(f"[VAE] Found existing checkpoint: {vae_ckpt_path}")
         try:
@@ -71,7 +70,7 @@ if __name__ == "__main__":
         vae_state = torch.load(vae_ckpt_path, map_location=device, weights_only=True)
         vae.load_state_dict(vae_state)
 
-    # 3) VAE latent 캐시 생성
+    # 3. VAE latent cache
     for split_name, path_list in [("train", train_paths), ("valid", valid_paths), ("test", test_paths)]:
         print(f"[LatentCache] Checking/Building latent cache for '{split_name}'...")
         # build_vae_latent_cache now accepts a list of paths
@@ -83,7 +82,7 @@ if __name__ == "__main__":
 
     print("[VAE] Latent cache ready.")
     
-    # 💡 [Data Reporting] Print dataset sizes
+    # Dataset size report
     print("\n--- Dataset Summary ---")
     for split_name, path_list in [("train", train_paths), ("valid", valid_paths), ("test", test_paths)]:
         total_samples = 0
@@ -102,7 +101,7 @@ if __name__ == "__main__":
     print("-----------------------\n")
 
 
-    # 4) DDPM 학습 및 평가 파이프라인 (Multi-Mode 지원)
+    # 4. DDPM training & evaluation
     modes = ['adaln-zero']
     base_save_dir = cfg.save_dir
 
@@ -117,7 +116,7 @@ if __name__ == "__main__":
         cfg.save_dir = f"{base_save_dir}_{mode}"
         os.makedirs(cfg.save_dir, exist_ok=True)
         
-        # DDPM 학습
+        # DDPM training
         out_name = f"ddpm_{getattr(cfg, 'diffusion_backbone', 'transformer')}_best.pt"
         ddpm_ckpt_path = os.path.join(cfg.save_dir, out_name)
 
@@ -191,8 +190,8 @@ if __name__ == "__main__":
             print(f"[DDPM {mode.upper()}] Training finished. checkpoint: {ddpm_ckpt_path}")
 
 
-        # 5) 결과 시각화 
-        vis_dir = f"vis_results_{mode}"apah
+        # 5. Visualization
+        vis_dir = f"vis_results_{mode}"
         if args.use_tmm: vis_dir += "_tmm"
         
         visualize_dispersion_comparison(
@@ -201,7 +200,7 @@ if __name__ == "__main__":
             use_tmm=args.use_tmm
         )
         
-        # 6) 평가 
+        # 6. Evaluation
         run_inference_and_evaluation(
             cfg, device, min_width=0.0, w_cfg=5.0, ddim_steps=50, eta=0.0,
             test_paths=test_paths, diffusion_path=ddpm_ckpt_path, vae_path=vae_ckpt_path,

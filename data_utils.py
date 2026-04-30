@@ -9,7 +9,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 import matplotlib.pyplot as plt
 
-# ==============================================================================
+
 
 def calculate_features(X):
     modulus = X[:, :, 0]
@@ -28,7 +28,7 @@ def pad_or_truncate_X(X, max_cells):
     return out
 
 def _runs_bool(b):
-    """bool 1D 배열 True 연속구간을 (start,end) (end포함) 리스트로"""
+    """Return list of (start, end_inclusive) runs where bool array b is True."""
     if not hasattr(b, 'shape'):
         return []
     _length = b.shape[0]
@@ -43,16 +43,16 @@ def _runs_bool(b):
     return runs
 
 def _smooth_1d(y, k=3):
-    """간단 이동평균(홀수 k)"""
+    """Simple moving average with odd kernel size k."""
     if k <= 1: return y
-    # k를 홀수로 보장
+    # ensure k is odd
     k = max(1, int(k) | 1)
     pad = k//2
     ypad = np.pad(y, (pad, pad), mode='edge')
     ker = np.ones(k)/k
     return np.convolve(ypad, ker, mode='valid')
 
-# --- 통합된 메인 마스크 함수 (D와 T 모두 사용) ---
+
 
 def build_band_mask(
     udr, sdr, trans=None,
@@ -63,28 +63,27 @@ def build_band_mask(
     out_mask=None
 ):
     """
-    분산 관계(UDR)와 Supercell Dispersion(SDR)을 사용하여 단일 샘플의 밴드 마스크를 생성합니다.
-    
+    Build a band mask for a single sample from UDR and SDR.
+
     Args:
-        udr (np.ndarray): 단일 샘플의 비접힘 분산 관계 (UDR). (F,) 형태.
-        sdr (np.ndarray): 단일 샘플의 슈퍼셀 분산 관계 (SDR). (F,) 형태.
-        trans (np.ndarray): 단일 샘플의 전달률 (Optional).
-        tol_zero (float): UDR=0 주변에서 밴드갭으로 간주할 허용 오차.
-        tol_pi (float): UDR=pi 주변에서 밴드갭으로 간주할 허용 오차.
-        bandgap_margin_bins (int): 밴드갭 경계에서 마진을 줄 빈 개수.
-        
+        udr: Unit-cell dispersion relation (F,).
+        sdr: Supercell dispersion relation (F,).
+        trans: Transmittance (optional, unused).
+        tol_zero: Tolerance around UDR=0 for bandgap detection.
+        tol_pi: Tolerance around UDR=π for bandgap detection.
+        bandgap_margin_bins: Margin bins at bandgap boundaries.
+
     Returns:
-        np.ndarray: 밴드 마스크 배열 (0: 전달 밴드, 1: 밴드갭, 2: 디펙트 밴드). (F,) 형태.
+        Band mask array (0: pass-band, 1: bandgap, 2: defect-band). Shape (F,).
     """
     u = np.nan_to_num(udr, nan=0.0, posinf=0.0, neginf=0.0)
     _length = u.shape[0]
 
-    # 1) UC gap mask 정의 (UDR 사용)
-    # 1a. 0과 pi 근처 영역을 각각 정의
+    # 1) Unit-cell gap mask from UDR
     is_near_zero = (np.abs(u - 0.0) <= tol_zero)
     is_near_pi = (np.abs(u - np.pi) <= tol_pi)
 
-    # 1b. 저주파 예외 처리 (0에서 시작하는 Acoustic branch)
+    # Exclude low-frequency acoustic branch starting near zero
     is_not_near_zero = ~is_near_zero
     first_pass_end = 0
     if _length > 0 and is_near_zero[0]:
@@ -93,11 +92,11 @@ def build_band_mask(
         else:
             first_pass_end = _length
 
-    # 1c. 최종 밴드갭 마스크
+    # Final bandgap mask
     uc_gap = (is_near_zero | is_near_pi).copy()
     uc_gap[0 : first_pass_end] = False
 
-    # 2) 기본 마스크 설정: gap=1, pass=0
+    # 2) Initialize mask: gap=1, pass=0
     if out_mask is None:
         mask = np.zeros_like(u, dtype=np.uint8)
     else:
@@ -106,7 +105,7 @@ def build_band_mask(
         
     mask[uc_gap] = 1
 
-    # 3) Defect Detection using Supercell Dispersion (SDR)
+    # 3) Defect detection using SDR
     s = np.nan_to_num(sdr, nan=0.0, posinf=0.0, neginf=0.0)
     gap_runs = _runs_bool(uc_gap)
     
@@ -114,14 +113,14 @@ def build_band_mask(
         gap_length = g_end - g_start + 1
         if gap_length < 3: continue
         
-        # 앞뒤로 여유(2포인트)를 두어 끝점 터치 확인 보완
+        # extend check region by 2 bins on each side
         check_s = max(0, g_start - 2)
         check_e = min(_length - 1, g_end + 2)
         
         band_vals = s[check_s : check_e + 1].copy()
         if band_vals.size == 0: continue
         
-        # Double Defect같이 밴드가 여러 번 꺾이는 부분(Extrema) 찾기
+        # Find extrema for multi-defect detection
         peaks, _ = find_peaks(band_vals, prominence=1.0)
         valleys, _ = find_peaks(-band_vals, prominence=1.0)
         
@@ -137,25 +136,23 @@ def build_band_mask(
             
             b_range = float(np.max(check_vals)) - float(np.min(check_vals))
             
-            # K-point resolution 한계를 고려하여 b_range > 2.5 이면 0~pi를 횡단한 것으로 인정
+            # A range >= 2.5 means SDR traverses 0↔π (defect band)
             if b_range >= 2.5:
-                # 결함 공진 주파수 = SDR이 π/2를 교차하는 지점 (선형 보간)
-                # 결함 밴드는 SDR이 0→π (또는 π→0)를 완전히 횡단할 때 발생하며
-                # π/2 교차점이 결함 공진 주파수를 물리적으로 정확하게 나타냄.
+                # Defect resonance frequency = SDR crossing at π/2 (linear interp)
                 half_pi = np.pi / 2.0
                 above = (check_vals > half_pi)
                 trans = np.where(np.diff(above.astype(np.int8)) != 0)[0]
 
                 if len(trans) > 0:
-                    ti = trans[0]   # π/2를 넘는 첫 번째 전환 인덱스
+                    ti = trans[0]
                     v1, v2 = float(check_vals[ti]), float(check_vals[ti + 1])
                     t = (half_pi - v1) / (v2 - v1) if abs(v2 - v1) > 1e-10 else 0.5
                     center_idx = check_s + seg_s + int(round(ti + t))
                 else:
-                    # Fallback: π/2에 가장 가까운 bin
+                    # Fallback: bin closest to π/2
                     center_idx = check_s + seg_s + int(np.argmin(np.abs(check_vals - half_pi)))
 
-                # center_idx가 uc_gap 경계에 걸릴 경우 1 bin 보정
+                # Snap center_idx into gap region if on boundary
                 if center_idx < _length and not uc_gap[center_idx]:
                     if center_idx + 1 < _length and uc_gap[center_idx + 1]:
                         center_idx += 1
@@ -169,40 +166,7 @@ def build_band_mask(
 
     return mask
 
-def split_datasets(X_list, D_list, F_list, M_list, cfg):
-    """
-    List of Arrays -> Concat -> Shuffle -> Split (8:1:1) -> Return Arrays
-    """
-    X_tr_l, D_tr_l, F_tr_l, M_tr_l = [], [], [], []
-    X_va_l, D_va_l, F_va_l, M_va_l = [], [], [], []
-    X_te_l, D_te_l, F_te_l, M_te_l = [], [], [], []
 
-    for X, D, F, M in zip(X_list, D_list, F_list, M_list):
-        total = X.shape[0]
-        tr = int(total * 0.8)
-        va = int(total * 0.1)
-        # te = rest
-        
-        # 2. 데이터 섞기 (Shuffle)
-        indices = np.random.permutation(total)
-        X, D, F, M = X[indices], D[indices], F[indices], M[indices]
-
-        # 데이터 분할
-        X_tr_l.append(X[:tr]);               D_tr_l.append(D[:tr]);               F_tr_l.append(F[:tr]);               M_tr_l.append(M[:tr])
-        X_va_l.append(X[tr:tr+va]);          D_va_l.append(D[tr:tr+va]);          F_va_l.append(F[tr:tr+va]);          M_va_l.append(M[tr:tr+va])
-        X_te_l.append(X[tr+va:]);            D_te_l.append(D[tr+va:]);            F_te_l.append(F[tr+va:]);            M_te_l.append(M[tr+va:])
-
-    # 3. np.concatenate로 모든 데이터 합치기
-    X_train = np.concatenate(X_tr_l, axis=0) if X_tr_l else np.zeros((0, cfg.max_cells, 6))
-    D_train = np.concatenate(D_tr_l, axis=0); F_train = np.concatenate(F_tr_l, axis=0); M_train = np.concatenate(M_tr_l, axis=0)
-    
-    X_valid = np.concatenate(X_va_l, axis=0) if X_va_l else np.zeros((0, cfg.max_cells, 6))
-    D_valid = np.concatenate(D_va_l, axis=0); F_valid = np.concatenate(F_va_l, axis=0); M_valid = np.concatenate(M_va_l, axis=0)
-    
-    X_test  = np.concatenate(X_te_l, axis=0) if X_te_l else np.zeros((0, cfg.max_cells, 6))
-    D_test  = np.concatenate(D_te_l, axis=0); F_test  = np.concatenate(F_te_l, axis=0); M_test  = np.concatenate(M_te_l, axis=0)
-
-    return X_train, D_train, F_train, M_train, X_valid, D_valid, F_valid, M_valid, X_test, D_test, F_test, M_test
 
 def visualize_sample_paper(
     frequencies,
@@ -212,13 +176,13 @@ def visualize_sample_paper(
     frf_row=None,
     figsize=(6, 3),
     colors=dict(
-        bandgap="#FFF2CC",      # 연노랑
-        pass_band="#E6F2FF",    # 연한 파랑 (Pass Band)
-        dont_care="#F2F2F2",    # 연한 회색 (Don't Care)
-        uc_line="#004080",      # 진파랑
-        sc_line="#8080FF",      # 연파랑
-        frf_line="#666666",     # 회색
-        defect_line="#CC0000",  # 빨강
+        bandgap="#FFF2CC",      # light yellow
+        pass_band="#E6F2FF",    # light blue
+        dont_care="#F2F2F2",    # light grey
+        uc_line="#004080",      # dark blue
+        sc_line="#8080FF",      # light blue
+        frf_line="#666666",     # grey
+        defect_line="#CC0000",  # red
     ),
     lw_uc=1.5, lw_sc=1.2, lw_frf=1.0, lw_defect=1.2,
     alpha_gap=0.4, alpha_bg=0.3,
@@ -319,9 +283,7 @@ def visualize_sample_paper(
     plt.close()
 
 def split_datasets(X_list, D_list, F_list, M_list, U_list, T_list, cfg):
-    """
-    List of Arrays -> Concat -> Shuffle -> Split (8:1:1) -> Return Arrays
-    """
+    """Shuffle and split arrays into train/valid/test (8:1:1) per folder."""
     X_tr_l, D_tr_l, F_tr_l, M_tr_l, U_tr_l, T_tr_l = [], [], [], [], [], []
     X_va_l, D_va_l, F_va_l, M_va_l, U_va_l, T_va_l = [], [], [], [], [], []
     X_te_l, D_te_l, F_te_l, M_te_l, U_te_l, T_te_l = [], [], [], [], [], []
@@ -330,15 +292,10 @@ def split_datasets(X_list, D_list, F_list, M_list, U_list, T_list, cfg):
         total = X.shape[0]
         tr = int(total * 0.8)
         va = int(total * 0.1)
-        # te = rest
-        
-        # 2. 데이터 섞기 (Shuffle)
         indices = np.random.permutation(total)
         idx_tr = indices[:tr]
         idx_va = indices[tr:tr+va]
         idx_te = indices[tr+va:]
-
-        # 데이터 분할 (Memory efficient slicing without full copy permutation first)
         X_tr_l.append(X[idx_tr]); D_tr_l.append(D[idx_tr]); F_tr_l.append(F[idx_tr]); M_tr_l.append(M[idx_tr]); U_tr_l.append(U[idx_tr])
         X_va_l.append(X[idx_va]); D_va_l.append(D[idx_va]); F_va_l.append(F[idx_va]); M_va_l.append(M[idx_va]); U_va_l.append(U[idx_va])
         X_te_l.append(X[idx_te]); D_te_l.append(D[idx_te]); F_te_l.append(F[idx_te]); M_te_l.append(M[idx_te]); U_te_l.append(U[idx_te])
@@ -348,14 +305,7 @@ def split_datasets(X_list, D_list, F_list, M_list, U_list, T_list, cfg):
         else:
             T_tr_l.append(np.zeros((0, cfg.k_points))); T_va_l.append(np.zeros((0, cfg.k_points))); T_te_l.append(np.zeros((0, cfg.k_points)))
 
-    # 3. np.concatenate로 모든 데이터 합치기
-    # Helper to concat or empty
-    # This helper is not used in the provided code, but the logic for empty lists is applied below.
-    # def _concat(lst, feat_dim, is_1d=False):
-    #     if not lst:
-    #         if is_1d: return np.zeros((0,), dtype=np.float32)
-    #         else: return np.zeros((0, feat_dim), dtype=np.float32)
-    #     return np.concatenate(lst, axis=0)
+    # Concatenate all splits
 
     X_train = np.concatenate(X_tr_l, axis=0) if X_tr_l else np.zeros((0, cfg.max_cells, 6))
     D_train = np.concatenate(D_tr_l, axis=0) if D_tr_l else np.zeros((0, cfg.k_points))
@@ -384,13 +334,12 @@ def split_datasets(X_list, D_list, F_list, M_list, U_list, T_list, cfg):
 
 
 def build_cache_multimat(cfg):
+    """Build per-material train/valid/test cache files from raw HDF5 data."""
     target_folders = getattr(cfg, "target_folders", ["CA", "SA", "TA"])
     print(f"[Cache] Building Multi-Material Cache from: {target_folders}")
     
-    # Local lists for splitting logic input
-    # But wait, logic below iterates folders.
-    
     def safe_load_hdf5(dataset, limit, chunk_size=5000):
+        """Read HDF5 dataset in chunks to avoid memory spikes."""
         # Determine actual size to read
         total_len = dataset.shape[0]
         read_len = min(limit, total_len)
@@ -419,7 +368,6 @@ def build_cache_multimat(cfg):
             
         print(f"--> Processing {folder_name} ({len(files)} files)...")
         
-        # Local lists for this folder only
         X_local, D_local, F_local, M_local, U_local, T_local = [], [], [], [], [], []
 
         for filename in files:
@@ -439,13 +387,11 @@ def build_cache_multimat(cfg):
                     freq_full = safe_load_hdf5(hf["frequencies"], limit)
                     frequencies = freq_full[:, :k_lim]
                     
-                    # Transmittance is no longer needed
-                    T_data = np.zeros((0, k_lim))
+                    T_data = np.zeros((0, k_lim))  # transmittance unused
             
                     X6 = calculate_features(design_variable)
                     X6 = pad_or_truncate_X(X6, cfg.max_cells)
-                    
-                    # Pass SDR (udi, sdi) to build_band_mask with pre-allocated memory
+
                     M = np.zeros((udr_relation.shape[0], k_lim), dtype=np.int8)
                     for i in range(udr_relation.shape[0]):
                         build_band_mask(udr_relation[i], sdr_relation[i], out_mask=M[i])
@@ -468,34 +414,33 @@ def build_cache_multimat(cfg):
                         if len(valid_runs) > 0:
                             p_single = getattr(cfg, "multi_bandgap_p_single", 0.5)
                             
-                            # valid_runs >= 2이고 확률 분기에서 multi-gap이 선택된 경우
+                            # decide single vs. multi-gap selection
                             use_multi = (len(valid_runs) >= 2) and (np.random.rand() >= p_single)
                             
                             # Create a new mask filled with 3 (Don't Care)
                             new_mask = np.full_like(curr_mask, 3, dtype=np.int8)
                             
                             if use_multi:
-                                # --- 2-gap 선택 ---
+                                # Select 2 gaps, sorted by frequency
                                 chosen = np.random.choice(len(valid_runs), size=2, replace=False)
-                                # 주파수 순서로 정렬 (낮은 쪽 먼저)
                                 chosen_runs = sorted([valid_runs[chosen[0]], valid_runs[chosen[1]]], key=lambda r: r[0])
                                 
                                 for (keep_start, keep_end) in chosen_runs:
-                                    # Pass-band boundary constraint (앞뒤 20 bins 패딩)
+                                    # 20-bin pass-band padding around gap
                                     pad_start = max(0, keep_start - 20)
                                     pad_end   = min(k_lim, keep_end + 1 + 20)
                                     new_mask[pad_start:keep_start]  = 0
                                     new_mask[keep_end + 1:pad_end]  = 0
-                                    # Gap 구간 원래 레이블 복원 (덮어쓰기로 gap 내부 보존)
+                                    # Restore original gap labels
                                     new_mask[keep_start:keep_end + 1] = curr_mask[keep_start:keep_end + 1]
                                 
-                                # 두 gap 사이 거리가 40 bins 미만이면 사이 구간도 Pass-band로
+                                # If inter-gap distance < 40 bins, fill with pass-band
                                 between_start = chosen_runs[0][1] + 1
                                 between_end   = chosen_runs[1][0]
                                 if between_end - between_start < 40:
                                     new_mask[between_start:between_end] = 0
                             else:
-                                # --- 1-gap 선택 (기존 방식) ---
+                                # Single-gap selection
                                 target_run_idx = np.random.randint(len(valid_runs))
                                 keep_start, keep_end = valid_runs[target_run_idx]
                                 
@@ -503,11 +448,11 @@ def build_cache_multimat(cfg):
                                 pad_start = max(0, keep_start - 20)
                                 pad_end = min(k_lim, keep_end + 1 + 20)
                                 
-                                # First, apply 0 to the padded region
+                                # Pass-band padding
                                 new_mask[pad_start:keep_start] = 0
                                 new_mask[keep_end+1:pad_end] = 0
                                 
-                                # Finally, restore the targeted gap and its defects
+                                # Restore gap labels
                                 new_mask[keep_start:keep_end+1] = curr_mask[keep_start:keep_end+1]
                             
                             M[i] = new_mask
@@ -530,7 +475,6 @@ def build_cache_multimat(cfg):
             print(f"[Cache] No valid data in {folder_name}.")
             continue
             
-        # Split & Save PER FOLDER
         print(f"--> Saving cache for {folder_name}...")
         (X_tr, D_tr, F_tr, M_tr, U_tr, T_tr,
          X_va, D_va, F_va, M_va, U_va, T_va,
@@ -538,8 +482,7 @@ def build_cache_multimat(cfg):
 
         os.makedirs(cfg.cache_dir, exist_ok=True)
         
-        # 💡 [Memory Optimization] Downcast massive float matrices to uncompressed np.float16 to avoid zipfile deadlock
-        # Save Dispersion Cache (X, U, D, M, F)
+        # Save dispersion cache (float16 to reduce disk I/O)
         np.savez(os.path.join(cfg.cache_dir, f"{folder_name}_train_dispersion.npz"), 
                  X=X_tr.astype(np.float16), U=U_tr.astype(np.float16), D=D_tr.astype(np.float16), M=M_tr, F=F_tr.astype(np.float16))
         
@@ -549,15 +492,9 @@ def build_cache_multimat(cfg):
         np.savez(os.path.join(cfg.cache_dir, f"{folder_name}_test_dispersion.npz"),  
                  X=X_te.astype(np.float16), U=U_te.astype(np.float16), D=D_te.astype(np.float16), M=M_te, F=F_te.astype(np.float16))
 
-        # Not saving Transmittance Cache
-        # np.savez_compressed(os.path.join(cfg.cache_dir, f"{folder_name}_train_transmittance.npz"), 
-        #                     X=X_tr, T=T_tr, M=M_tr, F=F_tr)
-        # np.savez_compressed(os.path.join(cfg.cache_dir, f"{folder_name}_valid_transmittance.npz"), 
-        #                     X=X_va, T=T_va, M=M_va, F=F_va)
-        # np.savez_compressed(os.path.join(cfg.cache_dir, f"{folder_name}_test_transmittance.npz"),  
-        #                     X=X_te, T=T_te, M=M_te, F=F_te)
+
         
-        # Clear memory
+
         del X_local, D_local, F_local, M_local, U_local, T_local
         import gc; gc.collect()
 
@@ -566,7 +503,7 @@ def build_cache_multimat(cfg):
 
 
 def _load_npz_6(path):
-    """npz에서 가능한 키를 모두 안전하게 읽어오기"""
+    """Safely load all available keys from a npz file."""
     try:
         with np.load(path) as data:
             keys = data.files
@@ -582,15 +519,13 @@ def _load_npz_6(path):
         return None, None, None, None, None, None
 
 def load_or_build_cache_multimat(cfg, strict=True):
-    """
-    Returns lists of paths.
-    Now follows split file naming: _dispersion.npz and _transmittance.npz
-    Primary path list returned is DISPERSION (for VAE/Diffusion).
+    """Return (train_paths, valid_paths, test_paths) for dispersion cache files.
+    Builds the cache from raw HDF5 data if any files are missing.
     """
     os.makedirs(cfg.cache_dir, exist_ok=True)
     target_folders = getattr(cfg, "target_folders", ["CA", "SA", "TA"])
     
-    # 1) 빌드 확인 (dispersion 파일 기준)
+    # Check if all caches exist
     missing = False
     for folder in target_folders:
         t_p = os.path.join(cfg.cache_dir, f"{folder}_train_dispersion.npz")
@@ -602,7 +537,7 @@ def load_or_build_cache_multimat(cfg, strict=True):
         ok = build_cache_multimat(cfg)
         if not ok: raise RuntimeError("Cache build failed.")
 
-    # 2) 경로 리스트 수집 (Return Dispersion paths primarily)
+    # Collect paths
     train_paths, valid_paths, test_paths = [], [], []
     
     for folder in target_folders:
@@ -613,12 +548,13 @@ def load_or_build_cache_multimat(cfg, strict=True):
     print(f"[Cache] Ready. {len(train_paths)} materials found (Dispersion).")
     return train_paths, valid_paths, test_paths
 
-# ==============================================================================
-# Helper functions for Feature construction (Differentiable)
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Feature construction helpers (differentiable)
+# ---------------------------------------------------------------------------
 
 def zero_pad_layers(layers: torch.Tensor, valid_mask_1D: torch.Tensor) -> torch.Tensor:
-    """layers [B,L,3] * valid_mask_1D [B,L] -> pad구간 0."""
+    """Zero out padding positions: layers [B,L,3] * valid_mask [B,L]."""
     return layers * valid_mask_1D.unsqueeze(-1).to(layers.dtype)
 
 def layers_to_six_features_torch(layers: torch.Tensor) -> torch.Tensor:

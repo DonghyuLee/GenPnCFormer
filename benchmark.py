@@ -27,7 +27,7 @@ def measure_efficiency(cfg, mode, device):
     cfg.cond_mode = mode
     
     # ---------------------------------------------------------
-    # 💡 Param Matching Logic
+    # Param matching
     # ---------------------------------------------------------
     # All models use parameters defined in config.py
     
@@ -125,7 +125,7 @@ def measure_quality(cfg, mode, device):
     cfg.cond_mode = mode
     
     # ---------------------------------------------------------
-    # 💡 Param Matching Logic (Must match train_comparison.py)
+    # Param matching
     # ---------------------------------------------------------
     print(f"[{mode.upper()}] Evaluation Config: W={cfg.transformer_width}, D={cfg.transformer_depth}")
 
@@ -171,8 +171,7 @@ def main():
     
     cfg = CFG()
     modes = ["adaln", "adaln-zero", "mhca"]
-    # modes = ["adaln", "mhca"]
-    # modes = ["mhca"]
+
 
     results = []
     

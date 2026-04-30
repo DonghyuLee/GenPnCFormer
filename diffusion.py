@@ -7,14 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from tqdm.auto import tqdm
-from vae import PositionalEncoding, unscale_from_tanh # Import unscale
-from data_utils import zero_pad_layers, layers_to_six_features_torch # Helpers
-# from surrogate.models.classifier import PnCFormerBandClassifier # Helpers
-from surrogate.models.pncformer import PnCFormer # Surrogate
-# ==============================================================================
+from vae import PositionalEncoding, unscale_from_tanh
+from data_utils import zero_pad_layers, layers_to_six_features_torch
+from surrogate.models.pncformer import PnCFormer
+
 
 class SinusoidalTimeEmbedding(nn.Module):
-    """ Sinusoidal time embedding (수정 없음) """
+    """Sinusoidal time embedding for diffusion timesteps."""
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -29,7 +28,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         return emb
 
 class AdaLN(nn.Module):
-    """ Feature-wise Linear Modulation (수정 없음) """
+    """Adaptive Layer Norm: Feature-wise Linear Modulation."""
     def __init__(self, cond_dim: int, width: int):
         super().__init__()
         self.fc = nn.Sequential(nn.Linear(cond_dim, width*2), nn.SiLU())
@@ -37,15 +36,13 @@ class AdaLN(nn.Module):
         h = self.fc(cond); gamma, beta = h.chunk(2, dim=-1)
         return gamma, beta
 
-# ==============================================================================
-# ⬇️ [신규] CrossAttention 모듈
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Cross-Attention Module
+# ---------------------------------------------------------------------------
 
 class CrossAttention(nn.Module):
-    """ 
-    표준 Cross-Attention 모듈
-    U-Net의 Query(x_q)가 밴드 마스크의 Context(context)를 참조합니다.
-    """
+    """Standard cross-attention: query (UNet features) attends to context (band mask)."""
     def __init__(self, query_dim: int, context_dim: int, n_heads: int = 8, head_dim: int = 64, dropout: float = 0.0):
         super().__init__()
         inner_dim = n_heads * head_dim
@@ -62,111 +59,84 @@ class CrossAttention(nn.Module):
         )
 
     def forward(self, x_q, context):
-        # x_q (query): [B, L_q, C_q] (U-Net 피처)
-        # context: [B, L_ctx, C_ctx] (밴드 마스크 시퀀스)
+        # x_q: [B, L_q, C_q], context: [B, L_ctx, C_ctx]
         
         q = self.to_q(x_q)
         k = self.to_k(context)
         v = self.to_v(context)
         
-        # Multi-head attention을 위해 head 차원 분리
+        # Split into multi-head attention dimensions
         q = q.view(q.shape[0], q.shape[1], self.n_heads, -1).transpose(1, 2) # [B, n_heads, L_q, head_dim]
         k = k.view(k.shape[0], k.shape[1], self.n_heads, -1).transpose(1, 2) # [B, n_heads, L_ctx, head_dim]
         v = v.view(v.shape[0], v.shape[1], self.n_heads, -1).transpose(1, 2) # [B, n_heads, L_ctx, head_dim]
         
-        # Attention score 계산
+        # Attention scores
         sim = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
         attn = sim.softmax(dim=-1)
         
-        # Value 벡터에 가중합
+        # Weighted sum of values
         out = torch.einsum('bhij,bhjd->bhid', attn, v)
         out = out.transpose(1, 2).reshape(x_q.shape[0], x_q.shape[1], -1) # [B, L_q, C_q]
         return self.to_out(out)
 
-# ==============================================================================
-# ⬇️ [대체] ResBlock1D -> AttnResBlock1D (AdaLN + Attention)
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# AttnResBlock1D (AdaLN + Cross-Attention hybrid)
+# ---------------------------------------------------------------------------
 
 class AttnResBlock1D(nn.Module):
-    """ 
-    1D Residual Block (AdaLN + Cross-Attention 하이브리드)
-    - AdaLN: 전역 조건 (t, mat, n_cells)
-    - Attention: 순차 조건 (band_mask)
-    """
+    """1D Residual block with AdaLN (global cond) and Cross-Attention (band mask)."""
     def __init__(self, width: int, adaln_dim: int, context_dim: int, dropout: float, n_heads: int = 4):
         super().__init__()
         self.norm1 = nn.GroupNorm(8, width)
         self.conv1 = nn.Conv1d(width, width, 3, padding=1)
         
-        # AdaLN (전역 조건용)
+        # AdaLN (global conditions)
         self.adaln = AdaLN(adaln_dim, width) 
         
-        # Attention (순차 조건용)
+        # Cross-Attention (sequential conditions)
         head_dim = width // n_heads
         self.attn = CrossAttention(query_dim=width, context_dim=context_dim, n_heads=n_heads, head_dim=head_dim)
-        self.norm_attn = nn.LayerNorm(width) # 1D Conv 호환을 위해 LayerNorm 사용
+        self.norm_attn = nn.LayerNorm(width)
 
         self.norm2 = nn.GroupNorm(8, width)
         self.conv2 = nn.Conv1d(width, width, 3, padding=1)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x, adaln_vec, context_vec):
-        # x: [B, C, L] (U-Net 피처)
-        # adaln_vec: [B, adaln_dim] (t, mat, n_cells)
-        # context_vec: [B, K, context_dim] (band_mask 시퀀스)
+        # x: [B, C, L], adaln_vec: [B, D], context_vec: [B, K, D]
 
-        # 1. AdaLN 파라미터 준비
         gamma, beta = self.adaln(adaln_vec)
+        h = self.conv1(F.silu(self.norm1(x)))
         
-        # 2. 1차 Conv
-        h = self.conv1(F.silu(self.norm1(x))) # [B, C, L]
-        
-        # 3. Attention
-        # 3a. 어텐션 입력을 위해 [B, C, L] -> [B, L, C]
-        h_attn = h.permute(0, 2, 1)
-        h_attn = self.norm_attn(h_attn)
-        
-        # 3b. Cross-Attention 수행
-        attn_out = self.attn(h_attn, context_vec)
-        
-        # 3c. Residual connection (skip)
-        h_attn = h_attn + attn_out
-        
-        # 3d. 다시 [B, L, C] -> [B, C, L]
+        # Cross-Attention: [B,C,L] -> [B,L,C] -> attn -> [B,C,L]
+        h_attn = self.norm_attn(h.permute(0, 2, 1))
+        h_attn = h_attn + self.attn(h_attn, context_vec)
         h = h_attn.permute(0, 2, 1)
 
-        # 4. AdaLN 적용 (Attention 이후)
+        # AdaLN modulation after attention
         h = h * (1 + gamma.unsqueeze(-1)) + beta.unsqueeze(-1)
-        
-        # 5. 2차 Conv
-        h = self.drop(h)
-        h = self.conv2(F.silu(self.norm2(h)))
+        h = self.drop(self.conv2(F.silu(self.norm2(h))))
         
         return x + h
 
-# ==============================================================================
-# ⬇️ [수정됨] BandMaskCondEncoder (풀링 제거)
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Band Mask Condition Encoders
+# ---------------------------------------------------------------------------
 
 class BandMaskCondEncoder(nn.Module):
-    """ 
-    Transformer-based Encoder for Band Mask 
-    - Embedding + Positional Encoding + Transformer Encoder
-    - This captures global context and precise location of defects.
+    """Transformer encoder for band mask conditioning.
+    Embeds discrete mask tokens and applies positional encoding + Transformer.
     """
     def __init__(self, n_classes: int, out_dim: int, n_layers: int = 2, nhead: int = 4):
         super().__init__()
         self.out_dim = out_dim
         
-        # 1. Embedding (0, 1, 2, 3 -> vector)
-        # 0: Pass, 1: Gap, 2: Defect, 3: Null/Uncond
-        self.embedding = nn.Embedding(n_classes + 1, out_dim)
+        self.embedding = nn.Embedding(n_classes + 1, out_dim)  # 0:Pass, 1:Gap, 2:Defect, 3:Uncond
         
-        # 2. Positional Encoding
-        # We assume max K points (e.g. 500). Let's set a safe max_len.
         self.pos_enc = PositionalEncoding(out_dim, dropout=0.0, max_len=1000)
         
-        # 3. Transformer Encoder
         enc_layer = nn.TransformerEncoderLayer(
             d_model=out_dim, nhead=nhead, dim_feedforward=4*out_dim,
             activation="gelu", batch_first=True, dropout=0.0
@@ -174,20 +144,10 @@ class BandMaskCondEncoder(nn.Module):
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers, enable_nested_tensor=False)
         
     def forward(self, band_mask: torch.Tensor):
-        # band_mask: [B, K]
-
-        # 1. Embed
-        x = self.embedding(band_mask.long())  # [B, K, out_dim]
-
-        # 2. Add Positional Encoding
+        x = self.embedding(band_mask.long())
         x = self.pos_enc(x)
-
-        # 3. Transform
-        # 💡 [Fix] Do NOT call self.transformer(x) — PyTorch's TransformerEncoder.forward()
-        #    runs `any(isinstance(m, ...) for m in self.modules())` on EVERY call.
-        #    Over 50 DDIM steps × 2 CFG × ~2600 batches = 260,000+ module-tree traversals,
-        #    this generator pressure corrupts the C heap and causes a segfault.
-        #    Manual loop is numerically identical (no padding mask, no nested tensor).
+        # Manual layer loop avoids TransformerEncoder.forward() self.modules() traversal
+        # that corrupts the C heap over many inference calls (PyTorch 2.x).
         for layer in self.transformer.layers:
             x = layer(x)
         if self.transformer.norm is not None:
@@ -195,36 +155,25 @@ class BandMaskCondEncoder(nn.Module):
 
         return x
 
+
 class BandMaskCondEncoder_DualConv(nn.Module):
-    """
-    Enhanced Dual-Channel Encoder for Band Mask with 1D Convolution
-    - Input 1: Original Band Mask (0: Pass, 1: Gap, 2: Defect)
-    - Input 2: Defect-Only Binary Mask (0: Normal, 1: Defect)
-    - Local Feature Extraction: Conv1d to mix neighboring mask information.
+    """Dual-channel encoder: original mask + defect-only binary mask,
+    fused via Conv1d before Transformer encoding.
     """
     def __init__(self, n_classes: int, out_dim: int, n_layers: int = 2, nhead: int = 4):
         super().__init__()
         self.out_dim = out_dim
         
-        # 1. Embeddings
-        # Ch1: Original (0, 1, 2, 3)
-        self.emb1 = nn.Embedding(n_classes + 1, out_dim)
-        # Ch2: Defect Only (0: Non-defect, 1: Defect)
-        self.emb2 = nn.Embedding(2, out_dim)
+        self.emb1 = nn.Embedding(n_classes + 1, out_dim)  # original mask
+        self.emb2 = nn.Embedding(2, out_dim)                # defect-only binary
         
-        # 2. Local Feature Extractor (Conv1d)
-        # Input: Concat[emb1, emb2] -> [B, 2*out_dim, K]
-        # Output: [B, out_dim, K]
+        # Local feature extractor: fuse two channels
         self.conv1d = nn.Sequential(
             nn.Conv1d(2 * out_dim, out_dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.BatchNorm1d(out_dim)
+            nn.GELU(), nn.BatchNorm1d(out_dim)
         )
         
-        # 3. Positional Encoding
         self.pos_enc = PositionalEncoding(out_dim, dropout=0.0, max_len=1000)
-        
-        # 4. Transformer Encoder
         enc_layer = nn.TransformerEncoderLayer(
             d_model=out_dim, nhead=nhead, dim_feedforward=4*out_dim,
             activation="gelu", batch_first=True, dropout=0.0
@@ -232,61 +181,42 @@ class BandMaskCondEncoder_DualConv(nn.Module):
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers, enable_nested_tensor=False)
         
     def forward(self, band_mask: torch.Tensor):
-        # band_mask: [B, K] (Values: 0, 1, 2)
-
-        # 1. Dual Channel Preparation
         mask_ch1 = band_mask.long()
-        mask_ch2 = (band_mask == 2).long()  # 0 or 1
+        mask_ch2 = (band_mask == 2).long()
+        x1 = self.emb1(mask_ch1); x2 = self.emb2(mask_ch2)
 
-        # 2. Embedding
-        x1 = self.emb1(mask_ch1)  # [B, K, D]
-        x2 = self.emb2(mask_ch2)  # [B, K, D]
+        x_cat = torch.cat([x1, x2], dim=-1).permute(0, 2, 1)
+        x_conv = self.conv1d(x_cat).permute(0, 2, 1)
 
-        # 3. Concat & Conv1d
-        # Conv1d expects [B, Channels, Length]
-        x_cat = torch.cat([x1, x2], dim=-1)  # [B, K, 2D]
-        x_cat = x_cat.permute(0, 2, 1)       # [B, 2D, K]
-
-        x_conv = self.conv1d(x_cat)          # [B, D, K]
-        x_conv = x_conv.permute(0, 2, 1)     # [B, K, D]
-
-        # 4. Positional Encoding
         x = self.pos_enc(x_conv)
-
-        # 5. Transform
-        # 💡 [Fix] Same as BandMaskCondEncoder — bypass TransformerEncoder.forward()
-        #    to avoid self.modules() genexpr on every call (see above for explanation).
+        # Manual layer loop (see BandMaskCondEncoder for rationale)
         for layer in self.transformer.layers:
             x = layer(x)
         if self.transformer.norm is not None:
             x = self.transformer.norm(x)
-
         return x
 
 class UNet1D(nn.Module):
     def __init__(self, latent_dim: int, width: int, depth: int, dropout: float, cfg: Any):
         super().__init__()
         self.spatial = 16; self.in_ch = width; self.width = width
-        d_cond_mat = 4 # E1, rho1, E2, rho2
-        
-        # 1. 전역(AdaLN) 조건부 정의
+        d_cond_mat = 4
         self.time_emb = SinusoidalTimeEmbedding(width)
         self.material_proj = nn.Sequential(nn.Linear(d_cond_mat, width), nn.SiLU())
         self.ncells_embed = nn.Embedding(cfg.max_cells + 1, width)
-        
-        # 💡 AdaLN 조건(t, mat, ncells)을 위한 최종 프로젝션
-        adaln_dim_in = width * 3 
-        adaln_dim_out = width # ResBlock에 전달될 최종 AdaLN 벡터 차원
+
+        # AdaLN: project concatenated (t, mat, ncells) into a single cond vector
+        adaln_dim_in = width * 3
+        adaln_dim_out = width
         self.adaln_proj = nn.Linear(adaln_dim_in, adaln_dim_out)
-        
-        # 2. 순차(Attention) 조건부 정의
-        context_dim = width # 밴드 마스크 시퀀스의 차원
+
+        # Band mask encoder produces cross-attention context
+        context_dim = width
         self.band_mask_enc = BandMaskCondEncoder(cfg.n_classes, context_dim)
         
-        # 3. U-Net 본체
+        # U-Net body
         self.inp = nn.Linear(latent_dim, self.in_ch * self.spatial)
         
-        # 💡 신규 AttnResBlock1D 사용
         self.downs = nn.ModuleList([
             AttnResBlock1D(width, adaln_dim_out, context_dim, dropout) for _ in range(depth)
         ])
@@ -300,21 +230,16 @@ class UNet1D(nn.Module):
 
     def forward(self, z_noisy, t, band_mask: torch.Tensor, material_conds, n_cells):
         B = z_noisy.size(0)
-        x = self.inp(z_noisy).view(B, self.in_ch, self.spatial)
-        
-        # 1. (신규) AdaLN 조건 벡터 'adaln_vec' 생성
+        # AdaLN condition vector
         t_emb = self.time_emb(t)
         mat_vec = self.material_proj(material_conds)
         ncells_vec = self.ncells_embed(n_cells)
+        adaln_vec = F.silu(self.adaln_proj(torch.cat([t_emb, mat_vec, ncells_vec], dim=-1)))
         
-        # 💡 밴드 마스크(band_mask_vec)는 여기서 제외
-        h = torch.cat([t_emb, mat_vec, ncells_vec], dim=-1) # [B, 3*width]
-        adaln_vec = F.silu(self.adaln_proj(h)) # Final AdaLN Cond Vec [B, adaln_dim_out]
-        
-        # 2. (신규) Cross-Attention 컨텍스트 벡터 'context_vec' 생성
-        context_vec = self.band_mask_enc(band_mask) # [B, K, context_dim]
-        
-        # 3. U-Net 본체 (adaln_vec와 context_vec를 모두 전달)
+        # Cross-attention context from band mask
+        context_vec = self.band_mask_enc(band_mask)
+
+        # U-Net forward
         feats = []; 
         for d in range(len(self.downs)):
             x = self.downs[d](x, adaln_vec, context_vec)
@@ -329,7 +254,6 @@ class UNet1D(nn.Module):
             x = x + feats[d]
             x = self.ups[d](x, adaln_vec, context_vec)
 
-        # 💡 [Fix] UNet1D.forward had no return statement — was silently returning None.
         x = x.view(B, -1)
         return self.outp(x)
 
@@ -623,11 +547,13 @@ class TransformerDiffBlock(nn.Module):
         return x
 
 
-# ==============================================================================
-# ⬇️ DDPM 및 훈련 로직
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# DDPM and Training
+# ---------------------------------------------------------------------------
 
 class DDPM(nn.Module):
+    """Denoising Diffusion Probabilistic Model with Classifier-Free Guidance."""
     def __init__(self, model: UNet1D, timesteps: int, beta_start: float, beta_end: float):
         super().__init__(); self.model = model; self.T = timesteps
         betas = torch.linspace(beta_start, beta_end, timesteps); alphas = 1.0 - betas
@@ -636,7 +562,6 @@ class DDPM(nn.Module):
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(self.alphas_cumprod))
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - self.alphas_cumprod))
         
-    # --- DDPM Forward (훈련) ---
     def q_sample(self, x0, t, noise=None):
         if noise is None: noise = torch.randn_like(x0)
         sc1 = self.sqrt_alphas_cumprod[t].unsqueeze(-1); sc2 = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(-1)
@@ -646,29 +571,26 @@ class DDPM(nn.Module):
         noise = torch.randn_like(x0)
         xt, true_noise = self.q_sample(x0, t, noise)
         
-        # 💡 U-Net은 이제 4개의 조건을 모두 받아 처리합니다.
+        # Pass all conditions to model
         predicted_noise = self.model(xt, t, band_mask, material_conds, n_cells)
         return predicted_noise, true_noise
         
-    # --- DDPM Sample (CFG 적용) ---
     @torch.no_grad()
     def p_sample_cfg(self, x, t, band_mask: torch.Tensor, material_conds, n_cells, w: float):
         
-        # 1. 조건부 예측 (eps_c) - 모든 조건 전달
+        # 1. Conditional prediction
         eps_c = self.model(x, t, band_mask, material_conds, n_cells)
         
-        # 2. 무조건부 예측 (eps_empty)
-        # 💡 [New] Unconditional Token = 3 (explicitly distinct from 0=Pass)
+        # 2. Unconditional prediction
+        # Uncond token = 3 (distinct from 0=Pass)
         null_band_mask = torch.full_like(band_mask, 3)
-        
-        # 💡 AdaLN 조건(mat, n_cells)은 그대로 전달하고, 
-        #    Attention 조건(band_mask)만 Null Token으로 교체
+        # AdaLN conds (mat, n_cells) remain; only band_mask is replaced with null token
         eps_empty = self.model(x, t, null_band_mask, material_conds, n_cells)
         
-        # 3. CFG 공식 적용 (수정 없음)
+        # 3. CFG application
         eps_cfg = eps_empty + w * (eps_c - eps_empty)
         
-        # DDPM 역확산 (수정 없음)
+        # DDPM reverse diffusion
         alpha_bar = self.alphas_cumprod[t].unsqueeze(-1); alpha = self.alphas[t].unsqueeze(-1); beta = self.betas[t].unsqueeze(-1)
         mean = (1.0 / torch.sqrt(alpha)) * (x - (beta / torch.sqrt(1 - alpha_bar)) * eps_cfg)
         
@@ -681,7 +603,7 @@ class DDPM(nn.Module):
 
     @torch.no_grad()
     def sample(self, B: int, band_mask: torch.Tensor, material_conds: torch.Tensor, n_cells: torch.Tensor, z_dim: int, device: torch.device, w: float = 4.0):
-        """ CFG 기반 샘플링 루프 (수정 없음) """
+        """Full DDPM sampling with CFG."""
         x = torch.randn(B, z_dim, device=device) 
         timesteps = torch.arange(self.T - 1, -1, -1, device=device, dtype=torch.long)
         
@@ -698,26 +620,20 @@ class DDPM(nn.Module):
         Clean DDIM Sampling
         x_{t-1} = sqrt(alpha_bar_{t-1}) * pred_x0 + dir_xt + noise
         """
-        # 1. Timeline Selection
-        # 💡 [Fix] Use numpy integer linspace to avoid float→int rounding that
-        #    could produce duplicate timestep indices with torch.linspace().long().
+        # Integer linspace avoids float->int rounding producing duplicate indices
         timesteps = np.linspace(0, self.T - 1, ddim_steps, dtype=int).tolist()[::-1]
 
-        # 2. Initial Noise
         z = torch.randn(B, z_dim, device=device)
 
-        # 3. Sampling Loop
         for i, t in enumerate(timesteps):
-            # Calculate t_prev
             t_prev = timesteps[i + 1] if i < len(timesteps) - 1 else -1
 
-            # Setup Tensors
             tt = torch.full((B,), t, device=device, dtype=torch.long)
 
             # Predict Noise (CFG)
             eps_c = self.model(z, tt, band_mask, material_conds, n_cells)
 
-            # Uncond Token = 3
+            # Unconditional noise for CFG
             null_band_mask = torch.full_like(band_mask, 3)
             eps_empty = self.model(z, tt, null_band_mask, material_conds, n_cells)
 
@@ -728,8 +644,7 @@ class DDPM(nn.Module):
             alpha_bar_t      = alpha_bars[t]
             alpha_bar_t_prev = alpha_bars[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=device)
 
-            # 💡 [Fix] Clamp the argument of sqrt to ≥ 0 to prevent NaN when eta > 0
-            #    and the ratio math produces a tiny negative due to floating-point error.
+            # Clamp to avoid NaN from negative sqrt argument (floating-point)
             sigma_ratio = torch.clamp(
                 (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev),
                 min=0.0
@@ -747,8 +662,7 @@ class DDPM(nn.Module):
             noise = torch.randn_like(z) if t_prev >= 0 else 0.0
             z = torch.sqrt(alpha_bar_t_prev) * pred_x0 + dir_xt + sigma_t * noise
 
-            # 💡 [Fix] Free ALL intermediate tensors (including scalars) to prevent
-            #    VRAM accumulation across 50 steps × thousands of batches.
+            # Free intermediates to prevent VRAM accumulation
             del eps_c, eps_empty, eps, pred_x0, dir_xt, noise, tt, null_band_mask
             del alpha_bar_t, alpha_bar_t_prev, sigma_t, sigma_ratio, dir_coef
 
@@ -756,9 +670,7 @@ class DDPM(nn.Module):
 
 
 class EMA:
-    """
-    Exponential Moving Average of model parameters.
-    """
+    """Exponential Moving Average of model parameters."""
     def __init__(self, model, decay=0.9999):
         self.decay = decay
         self.shadow = {}
@@ -775,8 +687,6 @@ class EMA:
                 self.shadow[name] = new_average.clone()
 
     def apply_shadow(self, model):
-        # param.data = 는 storage pointer를 교체하므로 optimizer 참조가 무효화됨
-        # copy_() 는 기존 storage에 값만 덮어쓰므로 외부 참조가 계속 유효
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         for name, param in model.named_parameters():
@@ -846,8 +756,7 @@ class LatentCondDataset(Dataset):
 @torch.no_grad()
 def validate_diffusion(ddpm, val_dl, cfg, device): 
     ddpm.eval()
-    total_loss = 0.0
-    num_elements = 0
+    total_loss = 0.0; num_elements = 0
     
     with torch.no_grad():
         for batch in val_dl:
@@ -859,8 +768,6 @@ def validate_diffusion(ddpm, val_dl, cfg, device):
 
             t = torch.randint(0, cfg.timesteps, (Bsz,), device=device).long()
             zt, noise = ddpm.q_sample(z0, t)
-
-            # 💡 ddpm.model에 4개 조건 전달 (수정 없음)
             pred = ddpm.model(zt, t, mask, material_conds, n_cells)
             
             loss = F.mse_loss(pred, noise, reduction='sum')
@@ -871,8 +778,8 @@ def validate_diffusion(ddpm, val_dl, cfg, device):
     return avg_loss
 
 
-# 💡 LR Scheduler Utility
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5):
+    """Cosine LR schedule with linear warmup."""
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
@@ -886,20 +793,18 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
     UNCOND_PROB = getattr(cfg, "uncond_prob", 0.1) 
     print(f"CFG Unconditional Dropout Probability: {UNCOND_PROB}")
     
-    # 💡 [Optimization] RTX 4080 Settings
+    # GPU optimizations
     if torch.cuda.is_available():
         # 1. Enable TF32 (TensorFloat-32)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         # 2. Enable CuDNN Benchmark
         torch.backends.cudnn.benchmark = True
-        print("[System] RTX 4080 Optimization Enabled: TF32=True, Benchmark=True")
+        print("[System] GPU Optimization Enabled: TF32=True, Benchmark=True")
     
-    # 1. 데이터 로더 준비
+    # Data loaders
     scale_factor = getattr(cfg, "latent_scale_factor", 1.0)
-    
-    # paths can be passed? No, we need to infer them from cache logic or pass them.
-    # We will change signature to accept train_paths, valid_paths
+    # paths can be passed from main.py
     
     tr_datasets = [LatentCondDataset(p, scale_factor=scale_factor) for p in train_paths]
     va_datasets = [LatentCondDataset(p, scale_factor=scale_factor) for p in valid_paths]
@@ -910,16 +815,12 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
     print(f"[DDPM Data] Training Samples: {len(tr_ds)}")
     print(f"[DDPM Data] Validation Samples: {len(va_ds)}")
     
-    # 💡 [Sampler Strategy] Complexity-Based Sampling (No Curriculum Loop)
-    n_defect_samples = 0
-    n_normal_samples = 0
-    # Weighted Sampler for ConcatDataset is tricky.
-    # We need to concatenate weights from all datasets.
+    # Weighted sampler for defect-enriched training
     
+    n_defect_samples = 0; n_normal_samples = 0
     all_weights = []
     
     for ds in tr_datasets:
-         # Each ds is LatentCondDataset
          try:
             M_local = ds.M
             defect_counts = np.sum(M_local == 2, axis=1)
@@ -950,7 +851,7 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
     val_dl   = DataLoader(va_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=getattr(cfg, "num_workers", 0), pin_memory=False)
     
 
-    # 💡 Model Selection
+    # Model selection
     backbone_type = getattr(cfg, "diffusion_backbone", "transformer")
     print(f"[DDPM] Using backbone: {backbone_type}")
     
@@ -968,7 +869,7 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
         
     ddpm = DDPM(model, cfg.timesteps, cfg.beta_start, cfg.beta_end).to(device)
 
-    # 💡 [Resume Logic]
+    # Resume from checkpoint
     start_epoch = 0
     best_val_loss = float('inf')
     
@@ -997,21 +898,20 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
 
     trainable_params = list(ddpm.parameters())
     weight_decay = getattr(cfg, "weight_decay", 0.0)
-    # [Fix] fused=True는 PyTorch 2.5.x에서 GradScaler + LR Scheduler 조합 시
-    # state_steps 불일치 RuntimeError를 일으킴 → foreach=False로 교체 (VAE와 동일)
+    # foreach=False avoids PyTorch 2.5.x GradScaler + LR Scheduler state_steps bug
     opt = torch.optim.AdamW(trainable_params, lr=cfg.lr_diffusion, weight_decay=weight_decay, foreach=False)
     
-    # 💡 [New] Scheduler Setup (Native PyTorch to prevent AMP state_steps bug)
+    # Scheduler
     num_training_steps = cfg.epochs_diffusion * len(train_dl)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_training_steps, eta_min=1e-6)
     
     print(f"[DDPM] Scheduler: CosineAnnealingLR (Total: {num_training_steps} steps)")
     
-    # 💡 [Optimization] AMP GradScaler
+    # AMP
     scaler = torch.amp.GradScaler('cuda')
     print("[DDPM] AMP Enabled.")
     
-    # 3. 훈련 루프
+    # Training loop
     
     if start_epoch >= cfg.epochs_diffusion:
         print(f"[DDPM] Already reached target epochs ({start_epoch} >= {cfg.epochs_diffusion}). Skipping training.")
@@ -1030,51 +930,37 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
             n_cells        = batch["n_cells"].to(device)
             mask           = batch["band_mask"].to(device) 
 
-            # 4. 💡 CFG 훈련 (조건 드롭아웃):
-            # Uncond Probability로 마스크를 '3' (Null Token)으로 교체
+            # CFG training: dropout band mask to null token (3) with probability UNCOND_PROB
             Bsz = z0.size(0)
             dropout_mask = torch.rand(Bsz, device=device) < UNCOND_PROB
-            
-            # Apply dropout to band_mask (Replace with 3)
-            # mask: [B, K]
             if dropout_mask.any():
-                # Create a copy to avoid modifying original batch tensor in place if reused
                 mask_cond = mask.clone()
                 mask_cond[dropout_mask] = 3
             else:
                 mask_cond = mask
 
             opt.zero_grad(set_to_none=True)
-            
-            # 5. DDPM Forward & Loss Calculation
+
             t = torch.randint(0, cfg.timesteps, (Bsz,), device=device).long()
             
-            # 💡 [Optimization] AMP Autocast
             with torch.amp.autocast('cuda'):
-                # ddpm.forward returns (predicted_noise, true_noise)
-                # We pass 'mask_cond' which contains '3' for dropped samples
                 pred_noise, true_noise = ddpm(z0, t, band_mask=mask_cond, material_conds=material_conds, n_cells=n_cells)
                 loss = F.mse_loss(pred_noise, true_noise)
             
-            # 💡 [Optimization] Scaled Backward
             scaler.scale(loss).backward()
-            
-            # 💡 [Optimization] Gradient Clipping
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(ddpm.parameters(), 1.0)
-            
             scaler.step(opt)
             scaler.update()
             scheduler.step()
             
-            # Update EMA weights
             ema.update(ddpm)
             
             last_batch_loss = loss.item()
             pbar.set_postfix({"mae": f"{last_batch_loss:.4f}"})
             batch_idx += 1
 
-            # 주기적 메모리 정리: 파편화 방지 (eval 루프와 동일 패턴)
+            # Periodic memory cleanup
             if batch_idx % 100 == 0:
                 import gc
                 gc.collect()
@@ -1082,20 +968,18 @@ def train_latent_diffusion(cfg, device, vae_decoder=None, surrogate_classifier=N
                     torch.cuda.empty_cache()
 
 
-        # Validation (Run every epoch for better tracking)
-        # Apply EMA weights before validation
+        # Validation with EMA weights
         ema.apply_shadow(ddpm)
         val_loss = validate_diffusion(ddpm, val_dl, cfg, device)
-        # Restore active weights after validation
+        # Restore active weights
         ema.restore(ddpm)
         
         print(f"Epoch {epoch+1} Val Loss (EMA): {val_loss:.6f}")
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            # Save format: ddpm_transformer_best.pt to distinguish backbone (defaults to transformer)
             out_name = f"ddpm_{getattr(cfg, 'diffusion_backbone', 'transformer')}_best.pt"
             
-            # Temporarily apply EMA to save the EMA weights as the main ddpm state
+            # Temporarily apply EMA to save EMA weights as main state
             ema.apply_shadow(ddpm)
             state_dict = {
                 "ddpm": ddpm.state_dict(),

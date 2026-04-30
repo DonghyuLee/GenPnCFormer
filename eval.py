@@ -11,7 +11,7 @@ from matplotlib.patches import Rectangle
 
 from diffusion import UNet1D, DDPM, DiffusionTransformer
 from vae import VAE_Decoder, scale_to_tanh, unscale_from_tanh
-from data_utils import build_band_mask
+from data_utils import build_band_mask, zero_pad_layers, layers_to_six_features_torch
 from data_generation.tmm_torch import TorchTMM
 
 # surrogate (PnCFormer)
@@ -20,19 +20,10 @@ from surrogate.models.pncformer import PnCFormer
 import gc
 
 
-# ==============================================================================
-# Utils: masks & padding
-# ==============================================================================
+# ---------------------------------------------------------------------------
+# Test Dataset
+# ---------------------------------------------------------------------------
 
-
-def zero_pad_layers(layers: torch.Tensor, valid_mask_1D: torch.Tensor) -> torch.Tensor:
-    """layers [B,L,3] * valid_mask_1D [B,L] -> pad구간 0."""
-    return layers * valid_mask_1D.unsqueeze(-1).to(layers.dtype)
-
-
-# ==============================================================================
-# Test Dataset (uses F from npz if available)
-# ==============================================================================
 
 class TestDataset(Dataset):
     def __init__(self, npz_path: str, max_cells: int, mat_name: str = ""):
@@ -114,45 +105,13 @@ class TestDataset(Dataset):
             "mat_name": self.mat_name,                                                 # str
         }
 
+# ---------------------------------------------------------------------------
+# Feature builder: layers -> 6 features
+# ---------------------------------------------------------------------------
 
-# ==============================================================================
-# Feature builder: layers -> 6 features (E, ρ already scaled), zero-padding semantics
-# ==============================================================================
+# NOTE: layers_to_six_features_torch is imported from data_utils.
+# A module-level alias is kept for backward compatibility with inverse_design.py.
 
-def layers_to_six_features_torch(layers: torch.Tensor) -> torch.Tensor:
-    """
-    layers: [B,L,3] with columns [E_scaled, rho_scaled, length].
-    Zero-padding rule: invalid cells produce zero features (no eps tricks).
-    """
-    modulus = layers[..., 0]
-    density = layers[..., 1]
-    length  = layers[..., 2]
-
-    X1 = modulus
-    X2 = density
-    X3 = length
-
-    mul_valid = (modulus > 0) & (density > 0)
-    div_valid = mul_valid
-
-    X4 = torch.zeros_like(modulus)
-    X4[mul_valid] = torch.sqrt(modulus[mul_valid] * density[mul_valid])
-
-    X5 = torch.zeros_like(modulus)
-    X5[div_valid] = torch.sqrt(modulus[div_valid] / density[div_valid])
-
-    X6 = torch.zeros_like(modulus)
-    valid_X6 = div_valid & (X5 > 0)
-    X6[valid_X6] = length[valid_X6] / X5[valid_X6]
-
-    # print(X1, X2, X3, X4, X5, X6)
-
-    return torch.stack([X1, X2, X3, X4, X5, X6], dim=-1)  # [B,L,6]
-
-
-# ==============================================================================
-# Surrogate band-solver (PnCFormer; uses batch freqs; mask-safety)
-# ==============================================================================
 
 class SurrogateBandSolver:
     def __init__(self, cfg, device):
@@ -251,10 +210,10 @@ class SurrogateBandSolver:
         X_feat = X_feat.to(self.device)
         valid_mask = valid_mask.to(self.device).bool()     # True=valid
 
-        # ✅ f는 [B, K] 로 유지 (절대 unsqueeze 하지 않음)
+        # f must stay [B, K] — never unsqueeze
         f = freqs.to(self.device)
         if f.dim() == 3 and f.size(-1) == 1:
-            f = f.squeeze(-1)  # 안전장치: [B,K,1]로 들어오면 [B,K]로 되돌림
+            f = f.squeeze(-1)  # safety: [B,K,1] -> [B,K]
 
         # PnCFormer expects src_key_padding_mask where True = Padding (Ignored)
         # valid_mask is True = Valid (Keep)
@@ -264,14 +223,14 @@ class SurrogateBandSolver:
         udr_pred = self.model_udr(X_feat, f, src_key_padding_mask=padding_mask)   # [B,K]
         sdr_pred = self.model_sdr(X_feat, f, src_key_padding_mask=padding_mask)   # [B,K]
 
-        # GPU → CPU 전에 모든 CUDA 커널 완료를 보장
+        # Synchronize CUDA before GPU->CPU transfer
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
         udr_np = udr_pred.detach().cpu().numpy()   # [B,K] — CPU copy
         sdr_np = sdr_pred.detach().cpu().numpy()   # [B,K] — CPU copy
 
-        # GPU 텐서를 즉시 해제: 다음 루프 GC가 CUDA 실행 중에 해제하는 것을 방지
+        # Free GPU tensors immediately to prevent GC releasing during CUDA execution
         del udr_pred, sdr_pred, X_feat, f, padding_mask
 
         band_masks = []
@@ -279,11 +238,6 @@ class SurrogateBandSolver:
             band_masks.append(build_band_mask(udr_np[i], sdr_np[i]).astype(np.int64))
 
         return torch.from_numpy(np.stack(band_masks, 0))
-
-
-# ==============================================================================
-# Exact Physics Solver (TMM)
-# ==============================================================================
 
 class TMMBandSolver:
     def __init__(self, cfg, device):
@@ -295,28 +249,13 @@ class TMMBandSolver:
 
     @torch.no_grad()
     def __call__(self, lengths_unscaled, material_conds, n_cells, freqs):
-        """
-        Mimics SurrogateBandSolver.__call__.
-        freqs is not strictly needed for TorchTMM init but we keep the signature.
-        """
         B, L, _ = lengths_unscaled.shape
-        lengths_c = lengths_unscaled.squeeze(-1).clone()  # [B, L]  — clone to allow masking
+        lengths_c = lengths_unscaled.squeeze(-1).clone()
 
-        # ⚠️ 핵심 수정: VAE 디코더는 항상 max_cells(14)개 출력을 생성하지만
-        # 실제 구조는 n_cells 개의 레이어만 유효함.
-        # n_cells 이후의 위치는 VAE 출력의 쓰레기 값(작은 양수)이 남아있어
-        # TMM이 이를 유효한 레이어로 처리하면 유령 셀이 추가되는 버그 발생.
-        # → n_cells를 기준으로 패딩 위치를 0으로 마스킹해야 함.
-        layer_idx = torch.arange(L, device=lengths_c.device).unsqueeze(0)  # [1, L]
-        valid_mask = (layer_idx < n_cells.to(lengths_c.device).unsqueeze(1))  # [B, L]
-        lengths_c = lengths_c * valid_mask.float()  # 패딩 레이어 강제 0
+        layer_idx = torch.arange(L, device=lengths_c.device).unsqueeze(0)
+        valid_mask = (layer_idx < n_cells.to(lengths_c.device).unsqueeze(1))
+        lengths_c = lengths_c * valid_mask.float()
 
-
-        # We assume material_conds has (E1, rho1, E2, rho2)
-        # However, they might be different per batch item. 
-        # TorchTMM currently takes scalar modulus_A, density_A in init.
-        # But in our dataset per material folder, they are constant across the batch.
-        # We'll use the first item in the batch to init TorchTMM (safe if batch is same material type).
         m_A = float(material_conds[0, 0].item()) * 1e9
         r_A = float(material_conds[0, 1].item())
         m_B = float(material_conds[0, 2].item()) * 1e9
@@ -334,22 +273,18 @@ class TMMBandSolver:
         
         K = tmm.f.shape[1]
 
-        # Identity matrix template
         I_cell = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=self.device)
         I_cell[..., 0, 0] = 1.0; I_cell[..., 1, 1] = 1.0
 
-        # Build UDR: TM_B @ TM_A (get_dispersion_relation_unitcell와 동일 순서)
         if L >= 2:
             TM_A = tmm.TM(m_A, r_A, lengths_c[:, 0].unsqueeze(-1).double())
             TM_B = tmm.TM(m_B, r_B, lengths_c[:, 1].unsqueeze(-1).double())
-            T_udr = torch.matmul(TM_B, TM_A)   # BA 순서
+            T_udr = torch.matmul(TM_B, TM_A)
             x_udr = torch.clamp(torch.real(T_udr[..., 0, 0] + T_udr[..., 1, 1]) / 2.0, -1.0, 1.0)
-            UDR_pred = torch.acos(x_udr).cpu().numpy()  # [B, K]
+            UDR_pred = torch.acos(x_udr).cpu().numpy()
         else:
             UDR_pred = np.zeros((B, K))
 
-        # Build SDR: 셀 단위 (TM_B @ TM_A) 구성 후 역순 chain multiply
-        # get_dispersion_relation_supercell과 동일한 방식
         num_cells = L // 2
         cell_tms = []
         for c in range(num_cells):
@@ -362,40 +297,31 @@ class TMMBandSolver:
             TM_layer_B = tmm.TM(m_B, r_B, l_B)
             TM_layer_A[~valid_A] = I_cell[~valid_A]
             TM_layer_B[~valid_B] = I_cell[~valid_B]
-            cell_tms.append(torch.matmul(TM_layer_B, TM_layer_A))   # BA 순서
+            cell_tms.append(torch.matmul(TM_layer_B, TM_layer_A))
 
-        # 역순으로 chain multiply: T = I @ cell[N-1] @ ... @ cell[0]
         T_sdr = I_cell.clone()
         for cell_tm in reversed(cell_tms):
             T_sdr = torch.matmul(T_sdr, cell_tm)
 
         x_sdr = torch.clamp(torch.real(T_sdr[..., 0, 0] + T_sdr[..., 1, 1]) / 2.0, -1.0, 1.0)
 
-        # GPU → CPU 변환 전 모든 CUDA 커널 완료 보장
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
         UDR_np = torch.acos(x_udr).cpu().numpy() if L >= 2 else np.zeros((B, K))
-        SDR_np = torch.acos(x_sdr).cpu().numpy()  # [B, K]
+        SDR_np = torch.acos(x_sdr).cpu().numpy()
 
-        # GPU 텐서 즉시 해제: scipy.find_peaks 호출 전에 CUDA 메모리 오염 방지
         del tmm, I_cell, cell_tms, T_sdr, x_sdr
         if L >= 2:
             del TM_A, TM_B, T_udr, x_udr
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Build Mask (pure CPU/numpy — scipy.find_peaks 사용)
         band_masks = []
         for i in range(B):
             band_masks.append(build_band_mask(UDR_np[i], SDR_np[i]).astype(np.int64))
 
         return torch.from_numpy(np.stack(band_masks, 0))
-
-
-# ==============================================================================
-# Inference & Evaluation
-# ==============================================================================
 
 @torch.no_grad()
 def run_inference_and_evaluation(cfg, device,
@@ -407,42 +333,19 @@ def run_inference_and_evaluation(cfg, device,
                                  diffusion_path: str | None = None,
                                  vae_path: str | None = None,
                                  use_tmm: bool = False):
-    """
-    1) DDPM 샘플링 → VAE 디코딩
-    2) Surrogate(PnCFormer) or Exact Physics (TMM)로 band mask 예측
-    3) condition band mask와 비교
-       - Bandgap (Class 1): IoU metrics
-       - Defect (Class 2): Tolerance metrics
-    """
-    evaluator_name = "TMM" if use_tmm else "Surrogate"
-    print(f"\n--- Starting Inference & Evaluation (VAE+DDPM + {evaluator_name}) ---")
 
-    # --- Checkpoints ---
+    evaluator_name = "TMM" if use_tmm else "Surrogate"
     ddpm_ckpt_path = diffusion_path if diffusion_path else os.path.join(cfg.save_dir, "ddpm_transformer_best.pt")
     vae_ckpt_path  = vae_path if vae_path else os.path.join(cfg.save_dir, "vae_model_best.pt")
 
-    # --- DDPM ---
-    ddpm_state = torch.load(ddpm_ckpt_path, map_location=device, weights_only=True)
-
-    # 💡 [Fix A] Disable NestedTensor BEFORE creating any model instance.
     if hasattr(torch.backends.cuda, 'enable_nested_tensor'):
         torch.backends.cuda.enable_nested_tensor = False
 
-    # 💡 [Fix B - ROOT CAUSE] PyTorch 2.5.x TransformerEncoderLayer.forward() runs
-    #    `any(len(getattr(m,'_forward_hooks',{})) + ... for m in self.modules())`
-    #    on EVERY forward call (line 822 of transformer.py) to check for attached hooks.
-    #    During inference: 50 DDIM steps × 2 CFG × 2600 batches = 260,000+ genexpr
-    #    executions, each traversing the full module tree. This causes heap corruption.
-    #
-    #    Setting fastpath=False makes the VERY FIRST condition in that check branch
-    #    return True immediately, bypassing the self.modules() genexpr entirely.
-    #    This is the official PyTorch 2.x API for this toggle.
     if hasattr(torch.backends, 'mha'):
         torch.backends.mha.set_fastpath_enabled(False)
-        print("[Eval] Disabled MHA fastpath to prevent self.modules() heap corruption.")
 
+    ddpm_state = torch.load(ddpm_ckpt_path, map_location=device, weights_only=True)
     backbone_type = getattr(cfg, "diffusion_backbone", "transformer")
-    print(f"[Eval] Using diffusion backbone: {backbone_type}")
 
     if backbone_type == "transformer":
         model = DiffusionTransformer(
@@ -460,36 +363,25 @@ def run_inference_and_evaluation(cfg, device,
     if "ddpm" in ddpm_state:
         ddpm.load_state_dict(ddpm_state["ddpm"])
     else:
-        print("[Eval] Loading generic state_dict for DDPM...")
         ddpm.load_state_dict(ddpm_state)
     ddpm.eval()
-    print("Loaded trained DDPM successfully.")
 
-    # --- VAE Decoder ---
     vae_decoder = VAE_Decoder(cfg).to(device)
     full_vae_state = torch.load(vae_ckpt_path, map_location=device, weights_only=True)
     decoder_keys = {k.replace("decoder.", "", 1): v for k, v in full_vae_state.items() if k.startswith("decoder.")}
     vae_decoder.load_state_dict(decoder_keys)
     vae_decoder.eval()
-    print("Loaded trained VAE Decoder.")
 
-    # --- Surrogate or TMM Solver ---
     if use_tmm:
-        print("[Eval] Initializing Exact Physics Solver (TMM)...")
         band_solver = TMMBandSolver(cfg, device)
     else:
-        print("[Eval] Initializing Deep Learning Surrogate Solver (PnCFormer)...")
         band_solver = SurrogateBandSolver(cfg, device)
 
-    # --- Data ---
-    # test_paths must be passed or we iterate
     if test_paths:
         paths = test_paths
     elif hasattr(cfg, "test_paths") and cfg.test_paths:
         paths = cfg.test_paths
     else:
-        # Fallback if not passed (though we should pass it from main)
-        # Try to guess
         paths = [
             os.path.join(cfg.cache_dir, f"{mat}_test_dispersion.npz")
             for mat in ["CA", "SA", "TA", "AC", "AS", "AT"]
@@ -497,44 +389,25 @@ def run_inference_and_evaluation(cfg, device,
         ]
 
     if not paths:
-        print("[Eval] No test files found. Using hardcoded CA fallback.")
         paths = [os.path.join(cfg.cache_dir, "CA_test_with_mask.npz")]
-
-    print(f"[Eval] Loading test data from {len(paths)} files: { [os.path.basename(p) for p in paths] }")
-
-    # Build per-material dataset (keep mat_name tag)
-    mat_names_order = ["TA", "CA", "SA", "AT", "AC", "AS"]  # display order
-    def _mat_from_path(p):
-        base = os.path.basename(p)          # e.g. "CA_test_dispersion.npz"
-        return base.split("_")[0]           # → "CA"
 
     test_datasets = [
         TestDataset(p, cfg.max_cells, mat_name=_mat_from_path(p))
         for p in paths
     ]
 
-    # --- Accumulators ---
     num_samples  = 0
-    DMA_DELTA    = 0.5  # tolerance δ in frequency units (kHz)
+    DMA_DELTA    = 0.5
 
-    # helper: empty sub-accumulator dict
     def _acc():
         return {"mbof_iou": 0.0, "mbof_n": 0, "dma_match": 0.0, "dma_n": 0}
 
-    # Total
     acc_total = _acc()
-    # Per-material  (keys: mat name strings)
     all_mats   = list({_mat_from_path(p) for p in paths})
     acc_by_mat = {m: _acc() for m in all_mats}
-    # Per-n_cells  (keys: 4,5,6,7 → layers 8,10,12,14)
-    # n_cells in dataset = number of layers (AB pairs × 2), so cells=4 → n_cells=8
-    # Group by unit-cell count = n_cells // 2
     acc_by_uc  = {uc: _acc() for uc in [4, 5, 6, 7]}
 
     W_CFG = getattr(cfg, "w_cfg_inference", w_cfg)
-    print(f"Running inference with CFG scale (w) = {W_CFG}")
-    print(f"Sampling method: DDIM (steps={ddim_steps}, eta={eta})")
-    print(f"Metrics: mBOF (bandgap IoU)  |  DMA(δ={DMA_DELTA:.2f}) (defect accuracy)")
 
     def _update_acc(acc, mbof_m, dma_m):
         acc["mbof_iou"]   += mbof_m["iou_sum"]
@@ -547,11 +420,10 @@ def run_inference_and_evaluation(cfg, device,
         dma  = acc["dma_match"] / max(acc["dma_n"],  1)
         return mbof, dma, acc["mbof_n"], acc["dma_n"]
 
-    # Iterate per-material dataset to keep mat_name accessible
     total_batches = sum(
         (len(ds) + cfg.batch_size - 1) // cfg.batch_size for ds in test_datasets
     )
-    pbar = tqdm(total=total_batches, desc="[Inference & Eval]")
+    pbar = tqdm(total=total_batches)
 
     for ds in test_datasets:
         mat = ds.mat_name
@@ -559,15 +431,13 @@ def run_inference_and_evaluation(cfg, device,
                          num_workers=0, pin_memory=False)
 
         for batch_idx, batch in enumerate(dl):
-            # inputs
-            material_conds = batch["material_conds"].to(device)       # [B, 4]
-            n_cells = torch.clamp(batch["n_cells"].to(device), min=1) # [B]
-            band_mask = batch["band_mask"].to(device)                 # [B, K]
-            freqs = batch["freqs"].to(device)                         # [B, K]
+            material_conds = batch["material_conds"].to(device)
+            n_cells = torch.clamp(batch["n_cells"].to(device), min=1)
+            band_mask = batch["band_mask"].to(device)
+            freqs = batch["freqs"].to(device)
             B = material_conds.size(0)
             num_samples += B
 
-            # 1) DDPM → z (DDIM Sampling)
             z_sampled = ddpm.sample_ddim(
                 B=B,
                 band_mask=band_mask,
@@ -589,41 +459,33 @@ def run_inference_and_evaluation(cfg, device,
             lengths_fp32 = torch.clamp(lengths_pred_unscaled.float().detach(), 0.0, 10.0)
             material_conds_fp32 = material_conds.float()
             
-            # Sanity check for NaN/Inf
             if torch.isnan(lengths_fp32).any() or torch.isinf(lengths_fp32).any():
-                print(f"\n[Error] NaN/Inf detected in predicted lengths at batch. Filling with zeros.")
                 lengths_fp32 = torch.nan_to_num(lengths_fp32, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # band_solver 호출 전 이전 루프의 CUDA 잔류 작업 완료 보장
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
             band_mask_pred = band_solver(
                 lengths_fp32, material_conds_fp32, n_cells, freqs,
-            )  # [B, K] — CPU
+            )
 
-            # 💡 [Fix] Sync every batch: ensures all CUDA kernels finish before
-            #    Python proceeds to the next iteration, preventing kernel overlap
-            #    that accumulates into heap corruption over thousands of batches.
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
-            # ── mBOF + DMA (total) ────────────────────────────────────────
             mbof_m = _mbof_batch(band_mask_pred, band_mask, freqs, min_width)
             dma_m  = _dma_batch(band_mask_pred,  band_mask, freqs, DMA_DELTA, min_width)
 
             _update_acc(acc_total,          mbof_m, dma_m)
             _update_acc(acc_by_mat[mat],    mbof_m, dma_m)
 
-            # ── per-n_cells breakdown ─────────────────────────────────────
-            nc_np = n_cells.cpu().numpy()              # [B] layer count (8/10/12/14)
+            nc_np = n_cells.cpu().numpy()
             bm_cpu = band_mask.cpu()
             freq_cpu = freqs.cpu()
-            bp_cpu   = band_mask_pred                  # already on CPU
+            bp_cpu   = band_mask_pred
 
             for uc in [4, 5, 6, 7]:
-                layer_target = uc * 2                  # 4→8, 5→10, 6→12, 7→14
-                sel = (nc_np == layer_target)          # bool [B]
+                layer_target = uc * 2
+                sel = (nc_np == layer_target)
                 if not sel.any():
                     continue
                 sel_t = torch.from_numpy(sel)
@@ -633,19 +495,13 @@ def run_inference_and_evaluation(cfg, device,
                     bp_cpu[sel_t], bm_cpu[sel_t], freq_cpu[sel_t], DMA_DELTA, min_width)
                 _update_acc(acc_by_uc[uc], mbof_uc, dma_uc)
 
-            # Progress bar
-            cur_mbof, cur_dma, _, _ = _fmt(acc_total)
-            pbar.set_postfix(mat=mat, mBOF=f"{cur_mbof:.4f}", DMA=f"{cur_dma:.4f}")
+            pbar.set_postfix(mat=mat)
             pbar.update(1)
 
-            # Explicit VRAM cleanup every batch
             del z_sampled, lengths_pred_scaled, lengths_pred_unscaled
             del lengths_fp32, material_conds_fp32, band_mask_pred
             del material_conds, n_cells, band_mask, freqs
 
-            # 💡 [Fix] Old condition `(num_samples // 128) % 100 == 0` only fires
-            #    at exact multiples of 12,800 — unreliable with variable last-batch size.
-            #    New: reliable batch counter, fires every 50 batches.
             if batch_idx % 50 == 49:
                 gc.collect()
                 if torch.cuda.is_available():
@@ -654,49 +510,11 @@ def run_inference_and_evaluation(cfg, device,
     pbar.close()
 
     if num_samples == 0:
-        print("No test samples evaluated.")
         return
 
-    # ── Print Results ──────────────────────────────────────────────────────
-    def _row(mbof, dma, mbof_n, dma_n):
-        return f"{mbof:.4f} (n={mbof_n:>6})   {dma:.4f} (n={dma_n:>6})"
-
-    sep  = "-" * 65
-    hdr  = f"{'':8s}  {'mBOF':>26s}   {'DMA(δ=0.50)':>26s}"
-
-    print(f"\n{'='*65}")
-    print(f"  Evaluation Results   (total samples: {num_samples})")
-    print(f"{'='*65}")
-
-    # 1) By material
-    print(f"\n  [1] By Material")
-    print(hdr); print(sep)
-    for m in mat_names_order:
-        if m not in acc_by_mat:
-            continue
-        mbof, dma, mn, dn = _fmt(acc_by_mat[m])
-        print(f"  {m:<6s}    {_row(mbof, dma, mn, dn)}")
-    print(sep)
     mbof_t, dma_t, mn_t, dn_t = _fmt(acc_total)
-    print(f"  {'Total':<6s}    {_row(mbof_t, dma_t, mn_t, dn_t)}")
-
-    # 2) By unit-cell count
-    print(f"\n  [2] By Unit-Cell Count")
-    print(hdr); print(sep)
-    for uc in [4, 5, 6, 7]:
-        mbof, dma, mn, dn = _fmt(acc_by_uc[uc])
-        print(f"  {uc} cells   {_row(mbof, dma, mn, dn)}")
-    print(sep)
-    print(f"  {'Total':<6s}    {_row(mbof_t, dma_t, mn_t, dn_t)}")
-    print(f"{'='*65}\n")
-
     return {"mBOF": mbof_t, "DMA": dma_t,
             "by_mat": acc_by_mat, "by_uc": acc_by_uc}
-
-
-# ==============================================================================
-# Qualitative viz: Transmittance (original vs generated)
-# ==============================================================================
 
 @torch.no_grad()
 def visualize_dispersion_comparison(cfg, device,
@@ -707,26 +525,11 @@ def visualize_dispersion_comparison(cfg, device,
                                        diffusion_path: str | None = None,
                                        vae_path: str | None = None,
                                        use_tmm: bool = False):
-    """
-    User Request:
-      - Bulk export: 6 Materials (CA..AT) * 28 Structures * 20 Samples = 3360 images.
-      - File: save_dir/{MAT}/{MAT}{STRUCT}_{sample_idx}.png
-      - Layout: Left=BandMask, Right=Transmittance
-      - Style: Box graphs, no text/labels, Red(solid)/Blue(dotted), consistent fonts.
-    """
-    
-
-    print(f"\n--- Starting Bulk Visualization ---")
-    print(f"Output Directory: {save_dir}")
     os.makedirs(save_dir, exist_ok=True)
-
-    # --- Load DDPM & VAE ---
     ddpm_ckpt_path = diffusion_path if diffusion_path else os.path.join(cfg.save_dir, "ddpm_transformer_best.pt")
     vae_ckpt_path  = vae_path if vae_path else os.path.join(cfg.save_dir, "vae_model_best.pt")
 
     ddpm_state = torch.load(ddpm_ckpt_path, map_location=device, weights_only=True)
-    
-    # model selection
     backbone_type = getattr(cfg, "diffusion_backbone", "transformer")
     if backbone_type == "transformer":
         model = DiffusionTransformer(
@@ -744,7 +547,6 @@ def visualize_dispersion_comparison(cfg, device,
     if "ddpm" in ddpm_state:
         ddpm.load_state_dict(ddpm_state["ddpm"])
     else:
-        print("[Viz] Loading generic state_dict for DDPM...")
         ddpm.load_state_dict(ddpm_state)
     ddpm.eval()
 
@@ -753,7 +555,6 @@ def visualize_dispersion_comparison(cfg, device,
     dec_keys = {k.replace("decoder.", "", 1): v for k, v in full_vae.items() if k.startswith("decoder.")}
     vae_decoder.load_state_dict(dec_keys); vae_decoder.eval()
 
-    # --- Surrogate (UDR & TR) ---
     base_dir = getattr(cfg, "surrogate_model_dir", "./surrogate/best_model")
     udr_ckpt = os.path.join(base_dir, "Transformer_UDR_v1.4.pth")
     tr_ckpt  = os.path.join(base_dir, "Transformer_TR_v1.4.pth")
@@ -767,7 +568,6 @@ def visualize_dispersion_comparison(cfg, device,
         try:
             st = torch.load(path, map_location=device, weights_only=True)
         except TypeError:
-            # 💡 [Fix] 'map_path' was a typo; the correct kwarg is 'map_location'.
             st = torch.load(path, map_location=device)
         if isinstance(st, dict):
             st = st.get("state_dict", st.get("model", st))
@@ -790,7 +590,7 @@ def visualize_dispersion_comparison(cfg, device,
     print(f"[Viz] Loading visualization data from {len(target_paths)} files (Fixed Order)...")
     
     X_list, M_list, F_list, D_list = [], [], [], []
-    # 💡 Track which materials were successfully loaded and their sizes
+    # Track which materials were loaded
     loaded_materials = []  # (mat_name, n_samples) in load order
     for mat, p in zip(materials, target_paths):
         if not os.path.exists(p):
@@ -828,11 +628,7 @@ def visualize_dispersion_comparison(cfg, device,
                       640, 650, 700, 720, 724, 725, 726, 730, 735, 736, 740, 746, 750, 760]
     BLOCK_SIZE = 2000  # Each h5 file contributes exactly 2000 test samples (20000 * 0.1)
 
-    # 💡 Build per-material structure->block mapping.
-    #    The cache is built by iterating sorted h5 files and concatenating their
-    #    test splits IN ORDER.  So block[i] = i-th h5 file's test samples.
-    #    If a file was skipped during cache build (e.g. SA760), the block count
-    #    is less than 28 — we detect this by comparing n_samples // BLOCK_SIZE.
+    # Build per-material structure->block mapping.
     mat_struct_map = {}  # mat_name -> list of (struct_val, global_start_idx)
     cum_global = 0
     for mat_name_l, n_samp in loaded_materials:
@@ -873,15 +669,14 @@ def visualize_dispersion_comparison(cfg, device,
         R = torch.where(use_mat2, r2, r1).expand_as(Ls)
         valid_mask = (idx < n_cells.unsqueeze(1))
         layers = torch.stack([E, R, Ls], dim=-1)
-        # 💡 [Fix] Do NOT call .squeeze(0) on valid_mask — it only works for B=1.
-        #    zero_pad_layers expects matching [B, L] shape for any batch size.
+        # Do NOT squeeze valid_mask — keep [B, L] shape for any batch size
         layers = zero_pad_layers(layers, valid_mask)
         return layers, valid_mask
 
 
     def _tmm_udr_sdr(layers, m_A, r_A, m_B, r_B):
-        """UDR/SDR을 get_dispersion_relation_supercell과 동일한 순서로 계산.
-        SDR: 셀 단위로 (TM_B @ TM_A) 구성 후 역순(마지막 셀부터) chain multiply.
+        """Compute UDR/SDR in the same order as get_dispersion_relation_supercell.
+        SDR: build per-cell TM (TM_B @ TM_A), then chain multiply in reverse order.
         """
         B = layers.shape[0]; L = layers.shape[1]
         lengths_c = layers[..., 2]
@@ -890,14 +685,14 @@ def visualize_dispersion_comparison(cfg, device,
         I_cell = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=device)
         I_cell[..., 0, 0] = 1.0; I_cell[..., 1, 1] = 1.0
 
-        # UDR: TM_B @ TM_A (참조 구현과 동일)
+        # UDR: TM_B @ TM_A (same as reference)
         TM_A0 = tmm.TM(m_A, r_A, lengths_c[:, 0].unsqueeze(-1).double())
         TM_B1 = tmm.TM(m_B, r_B, lengths_c[:, 1].unsqueeze(-1).double())
         T_udr = torch.matmul(TM_B1, TM_A0)
         x_udr = torch.clamp(torch.real(T_udr[..., 0, 0] + T_udr[..., 1, 1]) / 2., -1., 1.)
         U_np = torch.acos(x_udr).cpu().numpy()[0]  # [K]
 
-        # SDR: 셀 단위 (TM_B[2c+1] @ TM_A[2c]) 구성, 역순 chain multiply
+        # SDR: per-cell (TM_B[2c+1] @ TM_A[2c]), reverse chain multiply
         num_cells = L // 2
         cell_tms = []
         for c in range(num_cells):
@@ -908,13 +703,13 @@ def visualize_dispersion_comparison(cfg, device,
             valid_B = (l_B.squeeze(-1) > 1e-8)
             TM_layer_A = tmm.TM(m_A, r_A, l_A)
             TM_layer_B = tmm.TM(m_B, r_B, l_B)
-            # 유효하지 않은 레이어는 항등행렬로 대체
+            # Replace invalid layers with identity matrix
             TM_layer_A[~valid_A] = I_cell[~valid_A]
             TM_layer_B[~valid_B] = I_cell[~valid_B]
-            cell_tm = torch.matmul(TM_layer_B, TM_layer_A)  # BA 순서
+            cell_tm = torch.matmul(TM_layer_B, TM_layer_A)  # BA order
             cell_tms.append(cell_tm)
 
-        # 역순으로 chain multiply: T = I @ cell[N-1] @ ... @ cell[0]
+        # Reverse chain multiply: T = I @ cell[N-1] @ ... @ cell[0]
         T_sdr = I_cell.clone()
         for cell_tm in reversed(cell_tms):
             T_sdr = torch.matmul(T_sdr, cell_tm)
@@ -1151,26 +946,13 @@ def visualize_dispersion_comparison(cfg, device,
     # Create a single figure to reuse
     global_fig, global_axes = plt.subplots(1, 3, figsize=(12, 3), gridspec_kw={'width_ratios': [1, 1, 1]})
 
-    # RESUME LOGIC — skip materials/structures before these targets
-    TARGET_MAT = "CA"
-    TARGET_STRUCT = 400
-    mat_order = {m: i for i, m in enumerate(materials)}
-    struct_order = {s: i for i, s in enumerate(structures_all)}
+
 
     for mat_name, entries in mat_struct_map.items():
         mat_dir = os.path.join(save_dir, mat_name)
         os.makedirs(mat_dir, exist_ok=True)
 
-        # RESUME: skip materials before target
-        if mat_order.get(mat_name, 0) < mat_order.get(TARGET_MAT, 0):
-            print(f"[Viz] Skipping {mat_name} (before {TARGET_MAT})")
-            continue
-
         for struct_val, block_start in entries:
-            # RESUME: skip structures before target (only in target material)
-            if mat_name == TARGET_MAT and struct_order[struct_val] < struct_order[TARGET_STRUCT]:
-                continue
-
             for k in range(20):
                 # Spread 20 samples evenly over the BLOCK_SIZE window
                 local_offset = k * (BLOCK_SIZE // 20)  # = k * 100 when BLOCK_SIZE=2000
@@ -1185,9 +967,9 @@ def visualize_dispersion_comparison(cfg, device,
                 fname = f"{mat_name}{struct_val}_{k:02d}.png"
                 save_path = os.path.join(mat_dir, fname)
 
-                print(f"DEBUG: {fname} <- global_idx={global_idx} "
-                      f"(block_start={block_start}, k={k}, offset={local_offset})")
-                sys.stdout.flush()
+
+
+
 
                 try:
                     _viz_one_sample(X_all[global_idx], F_all[global_idx], M_all[global_idx],
@@ -1212,36 +994,36 @@ def _mask_to_intervals_1d(freqs: np.ndarray,
                           target_val: int = 2,
                           min_width: float = 0.0):
     """
-    freqs: [K] 주파수 샘플 (비균일 가능)
-    mask : [K] 정수 라벨 (defect=2 가정)
-    target_val: 구간을 만들 라벨 값 (기본 2)
-    min_width: 이 길이(주파수 폭) 미만 구간은 버림
-    return: [(start_f, end_f), ...]  (좌폐우개 구간, end>start)
+    freqs: [K] frequency samples (non-uniform possible)
+    mask : [K] integer labels (defect=2 assumed)
+    target_val: label value for intervals (default 2)
+    min_width: intervals narrower than this (in freq units) are discarded
+    return: [(start_f, end_f), ...]  (half-open intervals)
     """
     assert freqs.ndim == 1 and mask.ndim == 1 and freqs.shape[0] == mask.shape[0]
     K = freqs.shape[0]
     if K == 0:
         return []
 
-    # 주파수 bin edge 계산 (비균일 지원)
-    # edges[j] ~ freqs[j]와 freqs[j+1]의 중간값, 양 끝은 외삽
+    # Compute frequency bin edges (supports non-uniform spacing)
+    # edges[j] ~ midpoint of freqs[j] and freqs[j+1], extrapolated at boundaries
     edges = np.empty(K + 1, dtype=freqs.dtype)
     mids = (freqs[1:] + freqs[:-1]) / 2.0
     edges[1:K] = mids
     edges[0]   = freqs[0] - (mids[0] - freqs[0]) if K > 1 else freqs[0] - 1e-6
     edges[K]   = freqs[-1] + (freqs[-1] - mids[-1]) if K > 1 else freqs[-1] + 1e-6
 
-    # 타겟 라벨 연속 구간 탐지
+    # Detect contiguous regions of the target label
     is_t = (mask == target_val).astype(np.int32)
-    # run-length: 변화 지점
+    # Run-length: change points
     diff = np.diff(np.concatenate(([0], is_t, [0])))
-    starts = np.where(diff ==  1)[0]   # 포함 index
-    ends   = np.where(diff == -1)[0] - 1  # 포함 index
+    starts = np.where(diff ==  1)[0]   # inclusive index
+    ends   = np.where(diff == -1)[0] - 1  # inclusive index
 
     intervals = []
     for s, e in zip(starts, ends):
-        start_f = edges[s]      # s bin의 왼쪽 edge
-        end_f   = edges[e + 1]  # e bin의 오른쪽 edge
+        start_f = edges[s]      # left edge of bin s
+        end_f   = edges[e + 1]  # right edge of bin e
         if end_f > start_f and (end_f - start_f) >= min_width:
             intervals.append((float(start_f), float(end_f)))
     return intervals

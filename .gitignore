@@ -1,11 +1,26 @@
 __pycache__/
+*.pyc
 *.pt
 *.pth
 *.npy
 *.png
 *.log
 *.npz
+
+# IDE / Editor
 .vscode/
+.idea/
+*.swp
+
+# Virtual environment
+.venv/
+
+# Data & outputs
 data/
 outputs/
+vis_results*/
 .ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db

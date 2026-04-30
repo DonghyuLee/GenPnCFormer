@@ -19,7 +19,7 @@ from data_generation.tmm_torch import TorchTMM
 
 # ── interval matching helpers (previously in eval.py) ────────────────────────
 def _greedy_match_intervals(pred_intervals, gt_intervals, iou_thr=0.5):
-    """IoU 최대 기준 그리디 매칭. Returns (tp, fp, fn, matched_ious)."""
+    """Greedy matching by maximum IoU. Returns (tp, fp, fn, matched_ious)."""
     if len(pred_intervals) == 0 and len(gt_intervals) == 0:
         return 0, 0, 0, []
     used_p, used_g, pairs = set(), set(), []
@@ -42,7 +42,7 @@ def _greedy_match_intervals(pred_intervals, gt_intervals, iou_thr=0.5):
 
 
 def _match_intervals_tolerance(pred_intervals, gt_intervals, tol=0.5):
-    """Center distance <= tol 기준 그리디 매칭. Returns (tp, fp, fn, dists)."""
+    """Greedy matching by center distance <= tol. Returns (tp, fp, fn, dists)."""
     if len(pred_intervals) == 0 and len(gt_intervals) == 0:
         return 0, 0, 0, []
     p_c = [(p[0]+p[1])/2.0 for p in pred_intervals]
@@ -210,18 +210,18 @@ def batched_tmm_evaluation(lengths_c, nc, modulus_A, density_A, modulus_B, densi
     I_cell = torch.zeros((B, K, 2, 2), dtype=torch.complex128, device=device)
     I_cell[..., 0, 0] = 1.0; I_cell[..., 1, 1] = 1.0
 
-    # --- 1) Compute UDR: TM_B @ TM_A (get_dispersion_relation_unitcell와 동일 순서) ---
+    # --- 1) UDR: TM_B @ TM_A (same order as get_dispersion_relation_unitcell) ---
     if L_max >= 2:
         TM_A0 = tmm.TM(modulus_A, density_A, lengths_c[:, 0].double())
         TM_B1 = tmm.TM(modulus_B, density_B, lengths_c[:, 1].double())
-        T_udr = torch.matmul(TM_B1, TM_A0)   # BA 순서
+        T_udr = torch.matmul(TM_B1, TM_A0)   # BA order
         x_udr = torch.clamp(torch.real(T_udr[..., 0, 0] + T_udr[..., 1, 1]) / 2.0, -1.0, 1.0)
         UDR_pred = torch.acos(x_udr).cpu().numpy()  # [B, K]
     else:
         UDR_pred = np.zeros((B, K))
 
-    # --- 2) Compute SDR: 셀 단위 (TM_B @ TM_A) 구성 후 역순 chain multiply ---
-    # get_dispersion_relation_supercell과 동일한 방식
+    # --- 2) SDR: per-cell (TM_B @ TM_A), reverse chain multiply ---
+    # Same method as get_dispersion_relation_supercell
     num_cells = L_max // 2
     cell_tms = []
     for c in range(num_cells):
@@ -234,9 +234,9 @@ def batched_tmm_evaluation(lengths_c, nc, modulus_A, density_A, modulus_B, densi
         TM_layer_B = tmm.TM(modulus_B, density_B, l_B)
         TM_layer_A[~valid_A] = I_cell[~valid_A]
         TM_layer_B[~valid_B] = I_cell[~valid_B]
-        cell_tms.append(torch.matmul(TM_layer_B, TM_layer_A))   # BA 순서
+        cell_tms.append(torch.matmul(TM_layer_B, TM_layer_A))   # BA order
 
-    # 역순으로 chain multiply: T = I @ cell[N-1] @ ... @ cell[0]
+    # Reverse chain multiply: T = I @ cell[N-1] @ ... @ cell[0]
     T_sdr = I_cell.clone()
     for cell_tm in reversed(cell_tms):
         T_sdr = torch.matmul(T_sdr, cell_tm)
