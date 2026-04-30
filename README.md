@@ -283,8 +283,8 @@ See [`config.py`](config.py) for the complete list.
 
 ```bibtex
 @article{genpcnformer2026,
-  title={GenPnCFormer: Generative Design of Phononic Crystals via Latent Diffusion},
-  author={...},
+  title={GenPnCFormer: Latent Diffusion Transformer for Inverse Design of Variable Phononic Crystals},
+  author={D Lee, T Kim, JH Han, S Kim, BD Youn, SH Jo},
   year={2026}
 }
 ```
