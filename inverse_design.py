@@ -8,6 +8,7 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import MaxNLocator
 from tqdm.auto import tqdm
 from sklearn.decomposition import PCA
+from scipy.interpolate import CubicSpline
 
 from config import CFG
 from vae import VAE_Decoder
@@ -15,6 +16,75 @@ from diffusion import DDPM, DiffusionTransformer, UNet1D
 from eval import unscale_from_tanh, TestDataset, _mask_to_intervals_1d, _interval_iou
 from data_utils import build_band_mask
 from data_generation.tmm_torch import TorchTMM
+
+
+# ── FEM dispersion data loading ──────────────────────────────────────────────
+FEM_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FEM")
+
+# Mapping: scenario index (0-based) → (figure number, number of FEM bands)
+FEM_SCENARIO_MAP = {
+    0: {"fig": 10, "numFreq": 10},
+    1: {"fig": 11, "numFreq": 14},
+    2: {"fig": 12, "numFreq": 10},
+    3: {"fig": 13, "numFreq": 12},
+    4: {"file": "Figure_13_2_Data.txt", "numFreq": 13},  # 5d: SA 25-42kHz / 28&36kHz
+}
+
+
+def load_fem_dispersion(fem_info: dict, num_k: int = 16):
+    """Load FEM dispersion data from COMSOL export file.
+
+    COMSOL exports data band-by-band (C-order, 16 rows per band).
+    At kx=0, optical branches report freq≈0 due to degenerate eigenvalues;
+    we exclude kx=0 for bands where this artifact occurs.
+
+    Returns:
+        list of (kx_arr, freq_arr) tuples — one per band,
+        with kx normalized to [0, pi].
+    """
+    num_freq = fem_info["numFreq"]
+    if "file" in fem_info:
+        filepath = os.path.join(FEM_DATA_DIR, fem_info["file"])
+    else:
+        filepath = os.path.join(FEM_DATA_DIR, f"Figure_{fem_info['fig']}_Data.txt")
+    if not os.path.exists(filepath):
+        return None
+    data = np.loadtxt(filepath)
+    kx_raw = data[:num_k, 0]
+    kx_all = kx_raw / kx_raw.max() * np.pi  # (num_k,) 0→pi
+    freq_bands = data[:, 1].reshape(num_freq, num_k)  # C-order: (num_freq, num_k)
+
+    freq_matrix = freq_bands.copy()
+
+    # Greedy nearest-neighbor band tracking starting from kx[1]
+    # (kx=0 can have COMSOL degenerate-pair ordering issues).
+    # 1) Sort bands by kx[1] value as the reliable starting point.
+    order = np.argsort(freq_matrix[:, 1])
+    freq_matrix = freq_matrix[order]
+
+    tracked = np.zeros_like(freq_matrix)
+    tracked[:, 1] = freq_matrix[:, 1]   # anchor at kx[1]
+    # Back-extrapolate kx[0] linearly from kx[1] and kx[2]
+    for b in range(num_freq):
+        slope = (freq_matrix[b, 2] - freq_matrix[b, 1]) / (kx_all[2] - kx_all[1])
+        tracked[b, 0] = freq_matrix[b, 1] - slope * (kx_all[1] - kx_all[0])
+
+    # Forward greedy tracking from kx[2] onward
+    for k in range(2, num_k):
+        available = list(freq_matrix[:, k])
+        prev = tracked[:, k - 1]
+        assigned = []
+        used = [False] * num_freq
+        for p in prev:
+            best_i = min(
+                (i for i in range(num_freq) if not used[i]),
+                key=lambda i: abs(available[i] - p)
+            )
+            assigned.append(available[best_i])
+            used[best_i] = True
+        tracked[:, k] = assigned
+
+    return [(kx_all, tracked[b]) for b in range(num_freq)]
 
 
 # ── interval matching helpers (previously in eval.py) ────────────────────────
@@ -126,6 +196,58 @@ def build_scenario_masks(k_points=500, f_start=100.0, f_step=100.0):
         mask4[d_idx] = 2
     scenarios.append({
         "name": "4_DoubleDefect_25_35kHz_in_20_40", "mask": mask4, "type": "defect", "targets": [25, 35],
+        "mat": "SA", "nc": 7
+    })
+
+    # 5-A) SA 22-42kHz / defects 26,35 kHz
+    mask5a = np.full(k_points, 3, dtype=np.int32)
+    i1,i2=freq_to_idx(22),freq_to_idx(42)
+    mask5a[max(0,i1-20):i1]=0; mask5a[i2:min(k_points,i2+20)]=0; mask5a[i1:i2]=1
+    for f in [26,35]: mask5a[freq_to_idx(f)]=2
+    scenarios.append({"name":"5a_SA_26_35_in_22_42","mask":mask5a,"type":"defect","targets":[26,35],"mat":"SA","nc":7})
+
+    # 5-B) SA 20-40kHz / defects 23,33 kHz
+    mask5b = np.full(k_points, 3, dtype=np.int32)
+    i1,i2=freq_to_idx(20),freq_to_idx(40)
+    mask5b[max(0,i1-20):i1]=0; mask5b[i2:min(k_points,i2+20)]=0; mask5b[i1:i2]=1
+    for f in [23,33]: mask5b[freq_to_idx(f)]=2
+    scenarios.append({"name":"5b_SA_23_33_in_20_40","mask":mask5b,"type":"defect","targets":[23,33],"mat":"SA","nc":7})
+
+    # 5-C) SA 22-40kHz / defects 27,35 kHz
+    mask5c = np.full(k_points, 3, dtype=np.int32)
+    i1,i2=freq_to_idx(22),freq_to_idx(40)
+    mask5c[max(0,i1-20):i1]=0; mask5c[i2:min(k_points,i2+20)]=0; mask5c[i1:i2]=1
+    for f in [27,35]: mask5c[freq_to_idx(f)]=2
+    scenarios.append({"name":"5c_SA_27_35_in_22_40","mask":mask5c,"type":"defect","targets":[27,35],"mat":"SA","nc":7})
+
+    # 5-D) SA 25-42kHz / defects 28,36 kHz
+    mask5d = np.full(k_points, 3, dtype=np.int32)
+    i1,i2=freq_to_idx(25),freq_to_idx(42)
+    mask5d[max(0,i1-20):i1]=0; mask5d[i2:min(k_points,i2+20)]=0; mask5d[i1:i2]=1
+    for f in [28,36]: mask5d[freq_to_idx(f)]=2
+    scenarios.append({"name":"5d_SA_28_36_in_25_42","mask":mask5d,"type":"defect","targets":[28,36],"mat":"SA","nc":7})
+
+    # 5-E) SA 18-38kHz / defects 22,32 kHz
+    mask5e = np.full(k_points, 3, dtype=np.int32)
+    i1,i2=freq_to_idx(18),freq_to_idx(38)
+    mask5e[max(0,i1-20):i1]=0; mask5e[i2:min(k_points,i2+20)]=0; mask5e[i1:i2]=1
+    for f in [22,32]: mask5e[freq_to_idx(f)]=2
+    scenarios.append({"name":"5e_SA_22_32_in_18_38","mask":mask5e,"type":"defect","targets":[22,32],"mat":"SA","nc":7})
+
+    # 6) single defect-band matching — SA, 32 kHz in 25-40 kHz bandgap
+    mask6 = np.full(k_points, 3, dtype=np.int32)
+    f1, f2 = 25, 40
+    idx1, idx2 = freq_to_idx(f1), freq_to_idx(f2)
+    pad_start = max(0, idx1 - 20)
+    pad_end = min(k_points, idx2 + 20)
+    mask6[pad_start:idx1] = 0
+    mask6[idx2:pad_end] = 0
+    mask6[idx1:idx2] = 1
+    f = 32
+    d_idx = freq_to_idx(f)
+    mask6[d_idx] = 2
+    scenarios.append({
+        "name": "6_SingleDefect_32kHz_in_25_40", "mask": mask6, "type": "defect", "targets": [32],
         "mat": "SA", "nc": 7
     })
 
@@ -584,6 +706,19 @@ def run_inverse_design(cfg, mode="adaln-zero"):
                             axD.plot(np.pi/2, f_center, marker='*', markersize=12, color='g', zorder=3)
     
                         axD.plot(sdr_pred_snap, freqs_np_vis, color='b', linestyle=':', linewidth=1.5)
+
+                        # ── FEM dispersion overlay (solid black lines) ──
+                        scenario_idx = scenarios.index(scenario)
+                        if scenario_idx in FEM_SCENARIO_MAP:
+                            fem_info = FEM_SCENARIO_MAP[scenario_idx]
+                            fem_bands = load_fem_dispersion(
+                                fem_info["fig"], fem_info["numFreq"])
+                            if fem_bands is not None:
+                                for fem_kx, fem_freq in fem_bands:
+                                    axD.plot(fem_kx, fem_freq,
+                                             'r-', linewidth=0.8,
+                                             alpha=0.85, zorder=5)
+
                         axD.set_xlim(0, np.pi)
                         axD.set_ylim(freqs_np_vis.min(), freqs_np_vis.max())
                         axD.tick_params(direction='in', which='both', top=False, right=False,

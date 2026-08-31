@@ -6,6 +6,8 @@ __pycache__/
 *.png
 *.log
 *.npz
+*.pdf
+*.h5
 
 # IDE / Editor
 .vscode/
@@ -17,9 +19,24 @@ __pycache__/
 
 # Data & outputs
 data/
+data_v3/
 outputs/
 vis_results*/
+inverse_design_results/
+checkpoints/
 .ipynb_checkpoints/
+
+# Experiments (large result files)
+experiments/
+
+# Paper / manuscript (kept locally, excluded from GitHub)
+paper/
+FEM/
+plot_appendix_*.py
+
+# Surrogate data & checkpoints
+surrogate/data/
+surrogate/checkpoints/
 
 # OS files
 .DS_Store
